@@ -66,14 +66,23 @@ function brain(overrides: (directive: string) => string | null = () => null) {
         if (/CURRENT STEP: Follow-up on/.test(directive)) return "What is the time complexity of your solution?";
         if (/Close the interview/.test(directive)) return "Thanks Sam, that was a pleasure. [[END]]";
         if (/CURRENT STEP: The call dropped/.test(directive)) return "Welcome back, let's continue.";
-        if (/Follow-up turns used so far: \d of \d/.test(directive) || /Exchanges so far/.test(directive)) {
-            return /may not ask any more follow-ups|That is enough questions/.test(directive) ? "Thanks, that covers it. [[ADVANCE]]" : "Interesting, tell me more about that.";
+        // Like the real interviewer: a follow-up question while it may still ask one, and the marker once it is told to close.
+        // Every reply to an answer begins "Okay.", which the tests count to know which reply they are at.
+        if (/Follow-ups used: \d+ of \d+/.test(directive) || /Exchanges so far/.test(directive)) {
+            return /may not ask any more follow-ups|That is enough questions/.test(directive) ? "Okay. Thanks, that covers it. [[ADVANCE]]" : "Okay. What made you choose that?";
         }
+        if (/Your last reply did not ask anything/.test(directive)) return "So what made you choose that?";
         return "Okay.";
     };
 }
 
 let userId: string;
+/**
+ * Every interview a test started. Each is disposed when its test ends: one left running keeps its timers (a silence
+ * check-in, a problem being introduced again) and can write to the database after it has disconnected, which quietly
+ * reconnects and holds the test process open for ever.
+ */
+const running: LiveInterview[] = [];
 
 before(async () => { await resetDatabase(); });
 after(async () => { await prisma.$disconnect(); });
@@ -83,9 +92,12 @@ beforeEach(async () => {
     const user = await prisma.user.create({ data: { email: "sam@example.com", password: "x", name: "Sam Rivera" } });
     userId = user.id;
 });
-afterEach(() => setLlmForTesting(null));
+afterEach(async () => {
+    await Promise.all(running.splice(0).map((live) => live.dispose()));
+    setLlmForTesting(null);
+});
 
-async function setup(format: "quick" | "standard" = "quick", options: { llm?: FakeLlm; reconnectWindowMs?: number; transitionBeatMs?: number; rateLimitWaitMs?: number } = {}) {
+async function setup(format: "quick" | "standard" = "quick", options: { llm?: FakeLlm; reconnectWindowMs?: number; transitionBeatMs?: number; rateLimitWaitMs?: number; echoTailMs?: number } = {}) {
     const role = "Backend Engineer";
     const level = "mid" as const;
     const created = await prisma.interview.create({
@@ -110,8 +122,10 @@ async function setup(format: "quick" | "standard" = "quick", options: { llm?: Fa
         reconnectWindowMs: options.reconnectWindowMs,
         transitionBeatMs: options.transitionBeatMs ?? 120,
         rateLimitWaitMs: options.rateLimitWaitMs ?? 20,
+        echoTailMs: options.echoTailMs,
         onFinished: (id, info) => finished.push({ id, ...info }),
     });
+    running.push(live);
     const connect = async () => {
         await live.connect({ sdp: "v=0 offer that is long enough", type: "offer" });
         const voice = voices[voices.length - 1]!;
@@ -163,6 +177,19 @@ describe("LiveInterview", () => {
         const candidate = voice.of("CAPTION").filter((c) => c.role === "candidate");
         assert.ok(candidate.length >= 1 && candidate.length <= 5);
         assert.equal(candidate[candidate.length - 1].text, "I would use a hash map.");
+    });
+
+    test("asking to open the editor during an ordinary talk question opens a sketch pad for it, titled after the question", async () => {
+        const { connect, live } = await setup();
+        const voice = await connect();
+        const stopsBefore = voice.stops;
+        voice.handlers.onClientMessage(JSON.stringify({ type: "REQUEST_EDITOR" }));
+        await live.idle();
+        const shown = voice.of("SHOW_CODE_EDITOR").pop();
+        assert.equal(shown.mode, "notes");
+        assert.ok(shown.title, "titled after the current question, not left blank");
+        assert.equal(voice.of("NOTICE").length, 0, "nothing to apologise for: there was something to open");
+        assert.equal(voice.stops, stopsBefore, "asking for the editor is not treated as interrupting the interviewer");
     });
 });
 
@@ -264,11 +291,16 @@ async function until(condition: () => boolean, ms = 3_000) {
 }
 
 describe("LiveInterview: the interview follows what has been heard", () => {
-    /** Brings the interview to just before the introduction is closed: one substantial answer given. */
+    /**
+     * The introduction closes on its third answer: it always gets a follow-up, and here the scripted interviewer
+     * ("Okay. What made you choose that?") uses both. So its reply to that third answer is the one that closes it.
+     */
+    const INTRO_ANSWERS = 3;
+    /** Brings the interview to just before the introduction is closed: every answer but the last given. */
     async function afterFirstAnswer() {
         const ctx = await setup("quick", { transitionBeatMs: 400 });
         const voice = await ctx.connect();
-        await ctx.say(voice, ANSWER);
+        for (let i = 0; i < INTRO_ANSWERS - 1; i++) await ctx.say(voice, ANSWER);
         return { ...ctx, voice };
     }
     const rounds = (voice: FakeVoice) => voice.of("ROUND").map((e) => e.roundType);
@@ -279,7 +311,7 @@ describe("LiveInterview: the interview follows what has been heard", () => {
 
         voice.hold = true; // this reply closes the introduction, and is still being played
         voice.handlers.onCandidateTurn(ANSWER);
-        await until(() => voice.spoken.filter((s) => s === "Okay.").length === 2);
+        await until(() => voice.spoken.filter((s) => s === "Okay.").length === INTRO_ANSWERS);
         await sleep(700); // far longer than the pause: had the interview run ahead of the audio, it would have moved on by now
         assert.deepEqual(rounds(voice), ["intro"], "no new part while the last words are still playing");
         assert.ok(!voice.spoken.some((s) => /next question/.test(s)), "and no new question");
@@ -293,7 +325,7 @@ describe("LiveInterview: the interview follows what has been heard", () => {
     test("the candidate speaking in the pause calls the move off and they are answered where they are", async () => {
         const { voice, live } = await afterFirstAnswer();
         voice.handlers.onCandidateTurn(ANSWER);
-        await until(() => voice.spoken.filter((s) => s === "Okay.").length === 2);
+        await until(() => voice.spoken.filter((s) => s === "Okay.").length === INTRO_ANSWERS);
         await sleep(120); // inside the pause
         voice.handlers.onCandidateSpeaking("and one more thing I forgot to mention about that", false);
         await live.idle();
@@ -305,8 +337,11 @@ describe("LiveInterview: the interview follows what has been heard", () => {
     });
 
     test("an acknowledgement after a statement is not answered, and does not stop the move", async () => {
-        const { voice, live } = await afterFirstAnswer();
-        // The interviewer's last words ("Okay.") were not a question, so "right" needs no reply.
+        const ctx = await setup("quick", { transitionBeatMs: 400, llm: new FakeLlm(brain((d) => (/Follow-ups used/.test(d) ? "Okay, go ahead." : null))) });
+        const voice = await ctx.connect();
+        await ctx.say(voice, ANSWER);
+        const live = ctx.live;
+        // The interviewer's last words ("Okay, go ahead.") were not a question, so "right" needs no reply.
         const spokenBefore = voice.spoken.length;
         await ctx_say(voice, live, "right");
         assert.equal(voice.spoken.length, spokenBefore);
@@ -320,7 +355,7 @@ describe("LiveInterview: the interview follows what has been heard", () => {
     test("a quick 'yes, let's continue' during the pause confirms the move instead of cancelling it or going quiet", async () => {
         const { voice, live } = await afterFirstAnswer();
         voice.handlers.onCandidateTurn(ANSWER);
-        await until(() => voice.spoken.filter((s) => s === "Okay.").length === 2);
+        await until(() => voice.spoken.filter((s) => s === "Okay.").length === INTRO_ANSWERS);
         await sleep(30); // well inside the pause; this used to read as new speech and cancel the move
         voice.handlers.onCandidateSpeaking("Yes, let's continue", false);
         voice.handlers.onCandidateTurn("Yes, let's continue");
@@ -329,14 +364,14 @@ describe("LiveInterview: the interview follows what has been heard", () => {
         // If the confirmation had cancelled the move, it would have been reprocessed as a new answer to the
         // question already left behind: one more acknowledgement, and one more announced move, before it
         // eventually got there. Confirming instead of cancelling reaches the next question in a single move.
-        assert.equal(voice.spoken.filter((s) => s === "Okay.").length, 2, "the confirmation was not treated as a fresh answer to the old question");
+        assert.equal(voice.spoken.filter((s) => s === "Okay.").length, INTRO_ANSWERS, "the confirmation was not treated as a fresh answer to the old question");
     });
 
     test("cutting in while the last words are playing records what was heard, and what they said comes before any move", async () => {
         const { voice, live } = await afterFirstAnswer();
         voice.hold = true;
         voice.handlers.onCandidateTurn(ANSWER);
-        await until(() => voice.spoken.filter((s) => s === "Okay.").length === 2);
+        await until(() => voice.spoken.filter((s) => s === "Okay.").length === INTRO_ANSWERS);
         voice.handlers.onCandidateTurn("wait, before we go on, there is one thing I need to say about the design");
         await live.idle();
         assert.ok(voice.stops >= 1, "the interviewer was stopped");
@@ -356,7 +391,7 @@ describe("LiveInterview: the interview follows what has been heard", () => {
         const { voice, live } = await (async () => {
             const ctx = await setup("quick", { transitionBeatMs: 400, llm });
             const v = await ctx.connect();
-            await ctx.say(v, ANSWER);
+            for (let i = 0; i < INTRO_ANSWERS - 1; i++) await ctx.say(v, ANSWER);
             return { ...ctx, voice: v };
         })();
         voice.holdAfter = /next question/; // the new question starts and is still playing
@@ -377,7 +412,7 @@ describe("LiveInterview: the interview follows what has been heard", () => {
         const { voice, finished } = await afterFirstAnswer();
         voice.hold = true; // the interviewer is mid-sentence and would be for a long time
         voice.handlers.onCandidateTurn(ANSWER);
-        await until(() => voice.spoken.filter((s) => s === "Okay.").length === 2);
+        await until(() => voice.spoken.filter((s) => s === "Okay.").length === INTRO_ANSWERS);
         const started = Date.now();
         voice.handlers.onClientMessage(JSON.stringify({ type: "END_INTERVIEW" }));
         await until(() => finished.length === 1, 8_000);
@@ -400,6 +435,48 @@ describe("LiveInterview: the interview follows what has been heard", () => {
         voice.finishPlayback();
         await ctx.live.idle();
         assert.equal(voice.of("SHOW_CODE_EDITOR").length, 1, "it opens as the introduction ends");
+    });
+
+    test("talking over the problem's introduction does not pop the editor open: the problem is introduced again, then it opens", async () => {
+        const llm = new FakeLlm(brain());
+        const ctx = await setup("quick", { transitionBeatMs: 60, llm });
+        const voice = await ctx.connect();
+        voice.holdAfter = /first problem/;
+        for (let i = 0; i < 14 && !voice.hold; i++) {
+            voice.handlers.onCandidateTurn(ANSWER);
+            await Promise.race([ctx.live.idle(), until(() => voice.hold).catch(() => undefined)]);
+        }
+        assert.ok(voice.hold, "the problem is being introduced");
+
+        // Still finishing their last point, the candidate talks over it: only half of it has been heard.
+        voice.handlers.onCandidateTurn("sorry, just to finish that thought, we capped the retries at three");
+        await ctx.live.idle();
+
+        const history = (ctx.live as any).conductor.history as Array<{ role: string; text: string }>;
+        assert.ok(history.some((u) => u.role === "system" && /did not hear the coding problem introduced/.test(u.text)));
+        const presents = llm.calls.map((c) => c.messages.at(-1)!.content).filter((d) => /Coding problem \d of \d:/.test(d));
+        assert.equal(presents.length, 2, "introduced a second time");
+        assert.match(presents[1]!, /they spoke before you finished/);
+        assert.equal(voice.of("SHOW_CODE_EDITOR").length, 1, "and the editor opened once, after the introduction was heard");
+        assert.equal(voice.spoken.filter((s) => /first problem/.test(s)).length, 2);
+    });
+
+    test("the candidate can open the editor themselves rather than wait for the introduction to finish", async () => {
+        const ctx = await setup("quick", { transitionBeatMs: 60 });
+        const voice = await ctx.connect();
+        voice.holdAfter = /first problem/;
+        for (let i = 0; i < 10 && !voice.hold; i++) {
+            voice.handlers.onCandidateTurn(ANSWER);
+            await Promise.race([ctx.live.idle(), until(() => voice.hold).catch(() => undefined)]);
+        }
+        assert.equal(voice.of("SHOW_CODE_EDITOR").length, 0, "the interviewer has not opened it on its own yet");
+
+        // Answered synchronously, unlike a spoken turn: the interviewer's own introduction is still mid-playback
+        // (voice.hold is still true) and never finishes in this test, so anything that waited on live.idle() here
+        // would hang on that stuck playback forever. Opening the editor on request must not depend on it.
+        voice.handlers.onClientMessage(JSON.stringify({ type: "REQUEST_EDITOR" }));
+        assert.equal(voice.of("SHOW_CODE_EDITOR").length, 1, "asking for it opens the same problem right away");
+        assert.ok(voice.of("SHOW_CODE_EDITOR")[0].problem, "it is the real, current problem, not a placeholder");
     });
 });
 
@@ -451,7 +528,7 @@ describe("LiveInterview: a busy model", () => {
         const llm = new FakeLlm(brain());
         const ctx = await setup("quick", { llm, rateLimitWaitMs: 5 });
         const voice = await ctx.connect();
-        for (let i = 0; i < 8 && voice.of("SHOW_CODE_EDITOR").length === 0; i++) await ctx.say(voice, ANSWER);
+        for (let i = 0; i < 14 && voice.of("SHOW_CODE_EDITOR").length === 0; i++) await ctx.say(voice, ANSWER);
         const key = voice.of("SHOW_CODE_EDITOR")[0].problem.key as string;
         // Every attempt at the review is turned away.
         llm.enqueue(...Array.from({ length: 4 }, () => () => { throw new RateLimitedError(0); }));
@@ -467,7 +544,7 @@ describe("LiveInterview: coding", () => {
     async function toCoding() {
         const ctx = await setup("quick");
         const voice = await ctx.connect();
-        for (let i = 0; i < 8 && voice.of("SHOW_CODE_EDITOR").length === 0; i++) await ctx.say(voice, ANSWER);
+        for (let i = 0; i < 14 && voice.of("SHOW_CODE_EDITOR").length === 0; i++) await ctx.say(voice, ANSWER);
         assert.equal(voice.of("SHOW_CODE_EDITOR").length, 1, "the coding problem opened");
         return { ...ctx, voice };
     }
@@ -476,7 +553,7 @@ describe("LiveInterview: coding", () => {
         const llm = new FakeLlm(brain());
         const ctx = await setup("quick", { llm });
         const voice = await ctx.connect();
-        for (let i = 0; i < 8 && voice.of("SHOW_CODE_EDITOR").length === 0; i++) await ctx.say(voice, ANSWER);
+        for (let i = 0; i < 14 && voice.of("SHOW_CODE_EDITOR").length === 0; i++) await ctx.say(voice, ANSWER);
         const key = voice.of("SHOW_CODE_EDITOR")[0].problem.key as string;
 
         const code = "function solve(nums) {\n  const seen = new Map();\n  for (const n of nums) seen.set(n, true);\n}\n";
@@ -523,7 +600,7 @@ describe("LiveInterview: coding", () => {
         const llm = new FakeLlm(brain((d) => { if (/AUTHORITATIVE TEST RESULTS/.test(d)) seen.push(d); return null; }));
         const ctx = await setup("quick", { llm });
         const voice = await ctx.connect();
-        for (let i = 0; i < 8 && voice.of("SHOW_CODE_EDITOR").length === 0; i++) await ctx.say(voice, ANSWER);
+        for (let i = 0; i < 14 && voice.of("SHOW_CODE_EDITOR").length === 0; i++) await ctx.say(voice, ANSWER);
         const key = voice.of("SHOW_CODE_EDITOR")[0].problem.key as string;
 
         voice.handlers.onClientMessage(JSON.stringify({ type: "SUBMIT_CODE", problemKey: key, language: "javascript", code: "function nothing() {}" }));
@@ -539,6 +616,14 @@ describe("LiveInterview: coding", () => {
         await live.idle();
         assert.equal(voice.of("SUBMISSION_RESULT").length, 0);
         assert.equal(voice.of("NOTICE").pop().level, "warning");
+    });
+
+    test("the candidate can re-request the editor at any point in a coding round, e.g. after a reconnect dropped it", async () => {
+        const { voice, live } = await toCoding();
+        const before = voice.of("SHOW_CODE_EDITOR").length;
+        voice.handlers.onClientMessage(JSON.stringify({ type: "REQUEST_EDITOR" }));
+        await live.idle();
+        assert.equal(voice.of("SHOW_CODE_EDITOR").length, before + 1, "delivered again on request");
     });
 });
 
@@ -603,7 +688,7 @@ describe("LiveInterview: flooding", () => {
     test("submissions are spaced out, so the sandbox cannot be hammered from the call", async () => {
         const ctx = await setup("quick");
         const voice = await ctx.connect();
-        for (let i = 0; i < 8 && voice.of("SHOW_CODE_EDITOR").length === 0; i++) await ctx.say(voice, ANSWER);
+        for (let i = 0; i < 14 && voice.of("SHOW_CODE_EDITOR").length === 0; i++) await ctx.say(voice, ANSWER);
         const key = voice.of("SHOW_CODE_EDITOR")[0].problem.key as string;
         const submit = () => voice.handlers.onClientMessage(JSON.stringify({ type: "SUBMIT_CODE", problemKey: key, language: "javascript", code: JS_SOLUTIONS[key] }));
 
@@ -732,5 +817,50 @@ describe("approximateSpoken", () => {
         assert.equal(approximateSpoken(sentences, 0.6), "First sentence is here. Second sentence is here.");
         assert.equal(approximateSpoken(sentences, 1), sentences.join(" "));
         assert.equal(approximateSpoken([], 0.5), "");
+    });
+});
+
+// The two ways the interviewer went quiet in real interviews, replayed through the whole call.
+describe("LiveInterview: the interviewer never leaves the candidate waiting", () => {
+    test("a reply that asks nothing is followed by the interviewer carrying on, without the candidate having to say anything", async () => {
+        // "That's a solid project." and nothing else: before, both sides waited until the candidate said "hey, there's some problem".
+        const llm = new FakeLlm(brain((d) => (/Follow-ups used/.test(d) ? "That's a solid project." : null)));
+        const ctx = await setup("quick", { llm });
+        const voice = await ctx.connect();
+        await ctx.say(voice, ANSWER);
+
+        assert.ok(voice.spoken.includes("That's a solid project."));
+        assert.ok(voice.spoken.includes("So what made you choose that?"), "the follow-up came by itself");
+        assert.ok(voice.spoken.indexOf("So what made you choose that?") > voice.spoken.indexOf("That's a solid project."));
+        const history = (ctx.live as any).conductor.history as Array<{ role: string }>;
+        assert.equal(history.filter((u) => u.role === "candidate").length, 1, "the candidate said nothing more");
+    });
+
+    test("'let's move on' without the marker moves on, and the next question is asked", async () => {
+        const llm = new FakeLlm(brain((d) => (/Follow-ups used/.test(d) ? "Sure, let's move on to the next topic." : null)));
+        const ctx = await setup("quick", { llm });
+        const voice = await ctx.connect();
+        await ctx.say(voice, ANSWER);
+        await ctx.say(voice, ANSWER);
+        assert.ok(voice.of("ROUND").length >= 2, "the next part began");
+        assert.ok(voice.spoken.some((s) => /next question/.test(s)), "and its first question was asked, unprompted");
+    });
+
+    test("an answer in the interviewer's own words, given after it finished speaking, is heard, not thrown away as echo", async () => {
+        // The check-in "Want me to rephrase the question or give you more time?" and the answer "Give me more time":
+        // before, every such answer was dropped as echo, and the check-in came back every half minute for seven minutes.
+        const ctx = await setup("quick", { echoTailMs: 50 });
+        const voice = await ctx.connect();
+        assert.match(voice.spoken.join(" "), /Could you introduce yourself\?/);
+        await sleep(120); // the interviewer has stopped; this is a reply, not its voice coming back
+
+        voice.handlers.onCandidateSpeaking("Could you introduce yourself", false);
+        voice.handlers.onCandidateSpeaking("Could you introduce yourself again?", true);
+        voice.handlers.onCandidateTurn("Could you introduce yourself again?");
+        await ctx.live.idle();
+
+        assert.ok(voice.of("CAPTION").some((c) => c.role === "candidate" && c.final), "captioned as the candidate");
+        const history = (ctx.live as any).conductor.history as Array<{ role: string; text: string }>;
+        assert.ok(history.some((u) => u.role === "candidate" && /introduce yourself again/.test(u.text)), "and taken as their answer");
     });
 });

@@ -139,7 +139,7 @@ export interface ReportData {
     problems: ProblemReport[];
     strengths: Array<{ title: string; detail: string; evidence: Evidence[] }>;
     improvements: Array<{ title: string; detail: string; priority: 1 | 2 | 3; evidence: Evidence[] }>;
-    studyPlan: Array<{ topic: string; why: string; actions: string[]; priority: "high" | "medium" | "low"; resources: Array<{ title: string; url: string }>; evidence?: Evidence[] }>;
+    studyPlan: Array<{ topic: string; why: string; actions: string[]; priority: "high" | "medium" | "low"; resources: Array<{ title: string; url: string }>; evidence?: Evidence[]; problemTags?: string[] }>;
     metrics: {
         durationMinutes: number; candidateTurns: number; candidateWords: number; averageWordsPerTurn: number; fillersPer100Words: number;
         hintsUsed: number; problemsAttempted: number; problemsSolved: number; testPassRate: number; segmentsAnalysed: number; segmentsTotal: number;
@@ -158,7 +158,13 @@ export interface TranscriptEntry {
 }
 
 export interface ReportResponse {
-    interview: { id: string; role: string; level: Level; format: Format; status: InterviewMeta["status"]; startedAt: string | null; endedAt: string | null; endReason: string | null; rounds: Array<{ key: string; title: string; type: RoundType }> };
+    interview: {
+        id: string; role: string; level: Level; format: Format; status: InterviewMeta["status"];
+        startedAt: string | null; endedAt: string | null; endReason: string | null;
+        /** Set only for a "Practice this" retry: the report it continues. */
+        continuesFromId: string | null;
+        rounds: Array<{ key: string; title: string; type: RoundType }>;
+    };
     status: InterviewMeta["reportStatus"];
     error: string | null;
     report: ReportData | null;

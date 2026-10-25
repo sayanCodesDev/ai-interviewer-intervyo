@@ -44,26 +44,21 @@ export function Hero() {
     const y = useTransform(scrollYProgress, [0, 1], [48, 0]);
 
     return (
-        <section className="relative overflow-x-clip pt-32 pb-20 sm:pt-40 sm:pb-28">
+        <section className="relative overflow-x-clip pt-32 pb-20 sm:pt-44 sm:pb-28">
             <div className="page-container">
-                <p className="enter-fade label-mono flex items-center gap-2.5 text-muted-foreground" style={{ "--enter-delay": "0.1s" } as React.CSSProperties}>
-                    <span className="size-1.5 rounded-full bg-foreground" />
-                    Voice-first technical interviews
-                </p>
-
-                <h1 className="text-display relative isolate mt-6">
-                    <Line>A technical interview{" "}</Line>
+                <h1 className="text-display relative isolate">
+                    {/* The trailing space keeps the two lines apart in the page's text, for search engines and screen readers. */}
+                    <Line>Do the interview{" "}</Line>
                     <Line delay={0.09}>
-                        that <Emphasis>actually talks back.</Emphasis>
+                        <Emphasis>before the interview.</Emphasis>
                     </Line>
                 </h1>
 
-                <div className="mt-10 flex flex-col gap-8 md:flex-row md:items-end md:justify-between">
-                    <p
-                        className="enter-fade-up max-w-md text-[17px] leading-relaxed text-muted-foreground md:max-w-[22rem] lg:max-w-md"
-                        style={{ "--enter-delay": "0.45s" } as React.CSSProperties}
-                    >
-                        Talk to an AI interviewer, solve real problems in a live code editor, and get a scored report with a plan for what to practise next.
+                <div className="mt-10 grid gap-9 lg:mt-12 lg:grid-cols-[minmax(0,1fr)_auto] lg:items-end lg:gap-16">
+                    <p className="enter-fade-up text-lede max-w-[40rem] text-muted-foreground" style={{ "--enter-delay": "0.45s" } as React.CSSProperties}>
+                        <strong className="font-medium text-foreground">Intervyu</strong> is an AI interviewer for software engineers. It builds a real
+                        interview from the job you're applying for, talks it through with you out loud, follows your code as you write it, then scores every
+                        part and tells you exactly what to practise next.
                     </p>
 
                     <div
@@ -77,7 +72,7 @@ export function Hero() {
                         </Button>
                         <a
                             href="#how-it-works"
-                            className="group inline-flex items-center gap-2 text-sm font-medium whitespace-nowrap underline decoration-border underline-offset-4 transition-colors hover:decoration-foreground"
+                            className="group inline-flex items-center gap-2 text-[16px] font-medium whitespace-nowrap underline decoration-border underline-offset-4 transition-colors hover:decoration-foreground"
                         >
                             See how it works
                             <ArrowDown className="size-4 transition-transform duration-200 group-hover:translate-y-0.5" />
@@ -87,16 +82,15 @@ export function Hero() {
 
                 <div
                     className="enter-fade-up mt-14 sm:mt-20"
-                    style={{ perspective: 1600, "--enter-delay": "0.7s", "--enter-duration": "1s", "--enter-rise": "40px" } as React.CSSProperties}
+                    style={{ perspective: 1600, "--enter-delay": "0.8s", "--enter-duration": "1s", "--enter-rise": "40px" } as React.CSSProperties}
                 >
                     <m.div
                         ref={windowRef}
-                        className="mx-auto max-w-[1080px]"
+                        className="mx-auto max-w-[1120px]"
                         style={reduceMotion ? undefined : { rotateX, scale, y, transformOrigin: "50% 0%" }}
                     >
                         <ProductWindow />
                     </m.div>
-                    <p className="label-mono mt-6 text-center text-muted-foreground">The interview room · example session</p>
                 </div>
             </div>
         </section>

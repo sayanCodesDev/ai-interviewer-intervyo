@@ -1,6 +1,7 @@
 import tailwind from "bun-plugin-tailwind";
 import { rm, cp, readdir } from "node:fs/promises";
 import path from "node:path";
+import { fixEs6PromisePoolInterop } from "./build-plugins/fixEs6PromisePoolInterop";
 import { buildHeaders, buildNginxHeaders, inlineScriptHashes } from "./headers";
 
 const outdir = path.join(process.cwd(), "dist");
@@ -56,7 +57,7 @@ if (!isSet("VITE_BACKEND_URL")) {
 if (!isSet("VITE_SITE_URL")) {
   console.warn(
     "⚠️  VITE_SITE_URL is not set in frontend/.env.production — canonical URLs, the sitemap and " +
-    "social previews will point at https://ai-interviewer.example.com instead of your domain."
+    "social previews will point at https://intervyu.example.com instead of your domain."
   );
 }
 
@@ -65,7 +66,7 @@ const entrypoints = [...new Bun.Glob("src/**/*.html").scanSync()];
 const result = await Bun.build({
   entrypoints,
   outdir,
-  plugins: [tailwind],
+  plugins: [tailwind, fixEs6PromisePoolInterop],
   minify: true,
   target: "browser",
   sourcemap: "linked",
@@ -78,9 +79,33 @@ const result = await Bun.build({
     "import.meta.env.PROD": "true",
     "import.meta.env.DEV": "false",
     "import.meta.env.MODE": JSON.stringify("production"),
+    // A dependency (jotai, pulled in by @excalidraw/excalidraw) checks the bare `import.meta.env` object's
+    // truthiness rather than a specific property; without this Bun leaves the reference unresolved.
+    "import.meta.env": '{"PROD":true,"DEV":false,"MODE":"production"}',
     ...settingGlobals,
   },
 });
+
+// Bun's own build output correctly labels one JS artifact as the app's entry point (`kind: "entry-point"`),
+// but — reproduced with a minimal build, so this is Bun's bug, not a one-off — the <script type="module">
+// tag it writes into the HTML can reference a different, unrelated chunk instead when the module graph is
+// large enough (as it now is, with Excalidraw pulled in for the design-round whiteboard). That leaves the
+// app bootstrapping nothing: an empty #root, no console error, because the wrong chunk loads and executes
+// fine, it just never calls createRoot. Force the HTML to reference the artifact Bun's own metadata says is
+// actually the entry, rather than trusting what it wrote into the tag.
+{
+  const entryArtifact = result.outputs.find((o) => o.kind === "entry-point" && o.path.endsWith(".js"));
+  if (!entryArtifact) throw new Error("build: Bun reported no JS entry-point artifact — cannot verify the app's bootstrap script.");
+  const entryHref = `/${path.basename(entryArtifact.path)}`;
+  const indexPath = path.join(outdir, "index.html");
+  const html = await Bun.file(indexPath).text();
+  const scriptTag = /<script type="module"[^>]*\ssrc="([^"]+)"[^>]*><\/script>/.exec(html);
+  if (!scriptTag) throw new Error("build: could not find the app's <script type=\"module\"> tag in dist/index.html to verify.");
+  if (scriptTag[1] !== entryHref) {
+    console.warn(`⚠️  Bun referenced the wrong entry chunk in dist/index.html (${scriptTag[1]}, not the real entry ${entryHref}) — correcting it.`);
+    await Bun.write(indexPath, html.replace(scriptTag[0], scriptTag[0].replace(scriptTag[1]!, entryHref)));
+  }
+}
 
 // Copy public/ folder to dist/ (includes _redirects for Netlify, etc.)
 const publicDir = path.join(process.cwd(), "public");
@@ -106,6 +131,19 @@ try {
 
 // A stable URL for the logo (the bundled copy has a hashed name).
 await cp(path.join(process.cwd(), "src", "favicon.svg"), path.join(outdir, "favicon.svg"));
+
+// The design-round whiteboard's stylesheet, served as a static file for the same reason Monaco is above:
+// its package export is gated behind non-standard conditions that, if satisfied via Bun.build's own
+// `conditions` option, changed which chunk Bun treated as the app's entry script. See DesignCanvas.tsx.
+// Its one @font-face rule references "./fonts/Assistant/..." relative to the stylesheet's own URL, so that
+// folder has to travel with it or the toolbar silently falls back to the browser's default font.
+try {
+  const excalidrawProd = path.join(process.cwd(), "node_modules", "@excalidraw", "excalidraw", "dist", "prod");
+  await cp(path.join(excalidrawProd, "index.css"), path.join(outdir, "excalidraw", "index.css"));
+  await cp(path.join(excalidrawProd, "fonts", "Assistant"), path.join(outdir, "excalidraw", "fonts", "Assistant"), { recursive: true });
+} catch {
+  console.warn("⚠️  Could not copy Excalidraw's stylesheet and font. Run `bun install` so the design-round whiteboard is styled.");
+}
 
 // `import.meta.env` doesn't exist in a browser. If any of it survived into the bundle, that code reads
 // `undefined` (or throws) there, and a setting like the API address silently falls back to its default.

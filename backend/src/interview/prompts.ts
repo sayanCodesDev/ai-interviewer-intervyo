@@ -49,7 +49,19 @@ export interface TalkView {
     probesUsed: number;
     maxProbes: number;
     firstInRound: boolean;
+    /** The opening "tell me about yourself": kept light and conversational, and never closed after a single answer. */
+    introduction?: boolean;
     time: string;
+}
+
+/**
+ * How to begin a new part of the interview. Without it a part change is one flat "let's move on", which is what makes the
+ * switch from a conversation to, say, a coding problem feel sudden.
+ */
+function newPart(leftPart: string | null | undefined, what: string): string {
+    return leftPart
+        ? `This starts a new part. First close the ${leftPart.toLowerCase()} part in a few words, then say in one short sentence that you are moving on to ${what}, so the change feels natural rather than sudden.`
+        : `This starts a new part: first say one short sentence saying what it covers.`;
 }
 
 const lines = (...parts: Array<string | false | undefined>) => parts.filter((p) => p !== false && p !== undefined && p !== "").join("\n");
@@ -79,10 +91,10 @@ export const directives = {
             "No marker.",
         ),
 
-    ask: (view: TalkView, justAcknowledged: boolean) =>
+    ask: (view: TalkView, justAcknowledged: boolean, leftPart: string | null = null) =>
         lines(
             `CURRENT STEP: ${view.roundTitle}, question ${view.number} of ${view.total} (${view.topic}).`,
-            view.firstInRound ? "This starts a new part: first say one short sentence saying what it covers." : "Give a very short lead-in.",
+            view.firstInRound ? newPart(leftPart, `the ${view.roundTitle.toLowerCase()} part`) : "Give a very short lead-in.",
             justAcknowledged && "You just acknowledged their last answer; do not acknowledge it again.",
             `Ask in your own words, as one question: "${view.prompt}"`,
             view.lookFor.length > 0 && `A strong answer covers:\n${bullets(view.lookFor)}`,
@@ -107,12 +119,33 @@ export const directives = {
             moveOn && "- They have now given several very short answers in a row. Say kindly that it's fine, without pressing, and end your reply with [[ADVANCE]].",
             !moveOn && gap === "none" && (canProbe
                 ? mayMoveOn
-                    ? "- Then EITHER ask ONE targeted follow-up about a real gap, OR, if the answer was solid or you have heard enough, end your reply with [[ADVANCE]]."
-                    : "- They have said only a little so far, so do NOT move on and do not use [[ADVANCE]]. Ask ONE targeted follow-up, or invite them to say more about how they did it."
-                : "- You may not ask any more follow-ups on this question. Acknowledge and end your reply with [[ADVANCE]]."),
+                    ? view.introduction
+                        ? "- Then EITHER ask ONE more short, friendly follow-up, keeping it light (the deeper questions about their work come in the next part), OR, if you have a good sense of who they are, close the introduction in a sentence that asks nothing and end your reply with [[ADVANCE]]."
+                        : "- Then EITHER ask ONE targeted follow-up about a real gap, OR, if the answer was solid or you have heard enough, close the topic in a sentence that asks nothing and end your reply with [[ADVANCE]]."
+                    : view.introduction
+                        ? "- This is the introduction, so keep it light and conversational, like getting to know someone. Ask ONE short, friendly follow-up about something they mentioned, such as what they are working on now or what drew them to this kind of work. Do NOT move on yet and do not use [[ADVANCE]]."
+                        : "- They have said only a little so far, so do NOT move on and do not use [[ADVANCE]]. Ask ONE targeted follow-up, or invite them to say more about how they did it."
+                : "- You may not ask any more follow-ups on this question. Acknowledge it in a sentence that closes the topic, ask nothing, and end your reply with [[ADVANCE]]."),
             "- If it sounds like they might still be thinking or were cut short, keep your reply to a short encouraging sentence and let them continue.",
             candidateRambled && "- They spoke at length. Pick the one point that matters most and ask a focused follow-up about it, without recapping everything they said.",
             "Stay on this question. Never bring up a new topic or the next question yourself: the interview moves on only when you end with the marker.",
+            "Never ask two questions. Never say the marker aloud.",
+            view.time,
+        );
+    },
+
+    /** They opened a sketch pad themselves mid-question (see Conductor.editorEvent) and just shared what they drew,
+     * instead of or alongside speaking — e.g. sketching their own project's architecture for a background question. */
+    talkNotesRespond: (view: TalkView & { notes: string }) => {
+        const canProbe = view.probesUsed < view.maxProbes;
+        return lines(
+            `CURRENT STEP: ${view.roundTitle}, question ${view.number} of ${view.total} (${view.topic}). You asked: "${view.prompt}" — they opened the sketch pad themselves and have just shared a drawing instead of, or alongside, speaking.`,
+            untrustedBlock("what the candidate drew, described as text", view.notes),
+            view.lookFor.length > 0 && `A strong answer covers:\n${bullets(view.lookFor)}`,
+            "React in one or two sentences to what they've drawn, referring to something specific in it.",
+            canProbe
+                ? "Then EITHER ask ONE targeted follow-up about something the sketch doesn't cover, OR, if it's already thorough, end your reply with [[ADVANCE]]."
+                : "You may not ask any more follow-ups on this question. Acknowledge it and end your reply with [[ADVANCE]].",
             "Never ask two questions. Never say the marker aloud.",
             view.time,
         );
@@ -128,11 +161,26 @@ export const directives = {
             view.time,
         ),
 
-    presentProblem: (view: { number: number; total: number; title: string; difficulty: string; statement: string; firstProblem: boolean; why?: string; time: string }) =>
+    presentProblem: (view: {
+        number: number; total: number; title: string; difficulty: string; statement: string; firstProblem: boolean; why?: string;
+        /** The part just finished, when this problem starts a new one. */
+        leftPart?: string | null;
+        /** Introducing it again: the first time was lost ("retry"), or the candidate spoke over it ("spoke_over"). */
+        again?: "retry" | "spoke_over";
+        time: string;
+    }) =>
         lines(
             `CURRENT STEP: Coding problem ${view.number} of ${view.total}: "${view.title}" (${view.difficulty}). The code editor opens on their screen with the full statement and examples the moment you finish speaking.`,
+            view.again === "spoke_over" && "You had started to introduce this problem, but they spoke before you finished, most likely still finishing their previous point, so they have not heard it yet.",
+            view.again === "retry" && "You tried to introduce this problem a moment ago, but it did not get through, so they have not heard it yet.",
             "Do this in order, in at most four short sentences:",
-            "1. One short sentence that moves on from what you were just discussing to a coding problem.",
+            view.again === "spoke_over"
+                ? "1. Reply to what they just said in one short sentence, then say you'd like to move on to a coding problem now."
+                : view.again === "retry"
+                    ? "1. One short sentence saying you'll pick up where you left off, with a coding problem."
+                    : view.leftPart
+                        ? `1. Close the ${view.leftPart.toLowerCase()} part in a few words, then say you're moving on to a coding problem, so the change feels natural rather than sudden.`
+                        : "1. One short sentence that moves on from what you were just discussing to a coding problem.",
             `2. Describe the problem in your own words, just the idea, in one or two sentences: ${view.statement}`,
             view.why && `If it fits naturally, say in a few words that this kind of problem comes up in the role's ${view.why}. Do not force it.`,
             view.firstProblem
@@ -203,10 +251,10 @@ export const directives = {
             "No marker.",
         ),
 
-    designAsk: (view: { title: string; prompt: string; lookFor: string[]; firstInRound: boolean; time: string }) =>
+    designAsk: (view: { title: string; prompt: string; lookFor: string[]; firstInRound: boolean; leftPart?: string | null; time: string }) =>
         lines(
             `CURRENT STEP: System design: "${view.title}". An optional notes pad opens on their screen when you finish speaking.`,
-            view.firstInRound && "This starts the design part: say one short sentence to introduce it.",
+            view.firstInRound && newPart(view.leftPart, "a system design question"),
             `Pose it in your own words: ${view.prompt}`,
             "Ask them to start by clarifying requirements and stating assumptions, and to think aloud. Mention that a notes pad is opening if they want to jot things down. Then stop.",
             `A strong answer covers:\n${bullets(view.lookFor)}`,
@@ -228,13 +276,33 @@ export const directives = {
         );
     },
 
-    nudge: (view: { level: 1 | 2; context: string; code?: CodeOnScreen; time: string }) =>
+    /** `work` is what they are quietly doing: answering your question, writing code, or drawing on the whiteboard. */
+    nudge: (view: { level: 1 | 2; work: "answer" | "code" | "sketch"; code?: CodeOnScreen; time: string }) =>
         lines(
-            `CURRENT STEP: The candidate has been quiet a while. ${view.context}`,
+            `CURRENT STEP: The candidate has been quiet a while. ${{
+                answer: view.level === 1 ? "You are waiting for their answer to your last question." : "You are still waiting for their answer to your last question.",
+                code: view.level === 1 ? "They are writing code. Ask how it is going and whether they would like to talk through their approach." : "They may be stuck. Offer a hint if they would like one.",
+                sketch: view.level === 1 ? "They are drawing on the whiteboard, which takes time." : "They have been drawing on the whiteboard for a while.",
+            }[view.work]}`,
             view.code && codeOnScreen(view.code),
             view.code && "Say something specific about what is on the screen instead of a generic check-in: what looks like the start of a plan, or a question about a particular line. Never write or fix code for them.",
-            view.level === 1 ? "Check in gently in one short sentence; offer to rephrase or give more time." : "Say it is fine to pass, and ask whether they'd like to move on or hear a hint.",
+            view.work === "sketch"
+                ? view.level === 1
+                    ? "Check in gently in one short sentence: there's no rush, and they can talk you through it as they draw."
+                    : "In one short sentence, ask whether they'd like to walk you through what they have so far. Do not suggest moving on."
+                : view.level === 1 ? "Check in gently in one short sentence; offer to rephrase or give more time." : "Say it is fine to pass, and ask whether they'd like to move on or hear a hint.",
             "Don't advance yourself.",
+            view.time,
+            "No marker.",
+        ),
+
+    /** The last reply asked nothing and did not move on, which left both people waiting: go on, as a person would. */
+    carryOn: (view: { ask: string; again?: boolean; time: string }) =>
+        lines(
+            "CURRENT STEP: Your last reply did not ask anything, so the candidate is sitting in silence waiting for your next question.",
+            view.again && "You were told this a moment ago and still did not ask it. This time say only the question, nothing before it.",
+            view.ask,
+            "Reply with just that question, in one or two short sentences, ending with a question mark. Do not thank them, do not repeat or sum up your last reply, and do not say you are moving on or continuing.",
             view.time,
             "No marker.",
         ),

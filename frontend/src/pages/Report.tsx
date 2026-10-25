@@ -1,4 +1,4 @@
-import { ArrowRight, ChevronDown, Copy, Download, ExternalLink, Printer, Trash2 } from "lucide-react";
+import { ArrowRight, ChevronDown, Copy, Download, ExternalLink, Printer, Repeat, Trash2 } from "lucide-react";
 import { m } from "motion/react";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { Link, useNavigate, useParams } from "react-router-dom";
@@ -15,7 +15,7 @@ import { Spinner } from "@/components/ui/spinner";
 import { usePageTitle } from "@/hooks/usePageTitle";
 import { AppLayout } from "@/layouts/AppLayout";
 import { apiErrorMessage } from "@/lib/api";
-import { deleteInterview, fetchReport, retryReport } from "@/lib/interviews";
+import { continueInterview, deleteInterview, fetchReport, retryReport } from "@/lib/interviews";
 import { EASE_OUT_EXPO } from "@/lib/motion";
 import type { Evidence, ProblemReport, ReportResponse } from "@/lib/types";
 import { cn } from "@/lib/utils";
@@ -51,7 +51,7 @@ function Quotes({ items, onJump }: { items: Evidence[]; onJump: (turn: number) =
     return (
         <ul className="mt-3 grid gap-1.5">
             {items.map((e) => (
-                <li key={`${e.turn}-${e.quote}`} className="border-l-2 border-signal pl-3 text-[13.5px] leading-snug text-muted-foreground">
+                <li key={`${e.turn}-${e.quote}`} className="border-l-2 border-signal pl-3 text-[15.5px] leading-snug text-muted-foreground">
                     <span className="italic">“{e.quote}”</span>{" "}
                     <button type="button" onClick={() => onJump(e.turn)} className="whitespace-nowrap text-foreground underline decoration-border underline-offset-4 hover:decoration-foreground print:hidden">
                         see in transcript
@@ -106,8 +106,8 @@ function ProblemCard({ p }: { p: ProblemReport }) {
                 ))}
             </dl>
 
-            {p.feedback && <p className="mt-5 text-[15px] leading-relaxed">{p.feedback}</p>}
-            {p.codeQuality && <p className="mt-3 text-[15px] leading-relaxed text-muted-foreground">{p.codeQuality}</p>}
+            {p.feedback && <p className="mt-5 text-[17px] leading-relaxed">{p.feedback}</p>}
+            {p.codeQuality && <p className="mt-3 text-[17px] leading-relaxed text-muted-foreground">{p.codeQuality}</p>}
 
             <div className="mt-5 grid gap-3 rounded-lg bg-secondary/60 p-4 text-sm sm:grid-cols-2">
                 <p><span className="label-mono block text-muted-foreground">Complexity you gave</span>{p.complexity.stated ?? "Not stated"} <span className="text-muted-foreground">· {VERDICT[p.complexity.verdict]}</span></p>
@@ -135,6 +135,8 @@ export function Report() {
     const [highlight, setHighlight] = useState<number | null>(null);
     const [confirmDelete, setConfirmDelete] = useState(false);
     const [retrying, setRetrying] = useState(false);
+    // "all", a topic string, or null: tracks which single "Practice this" button is in flight, so only that one shows a spinner.
+    const [practicing, setPracticing] = useState<string | null>(null);
 
     const load = useCallback(async () => {
         try {
@@ -164,6 +166,16 @@ export function Report() {
         };
     }, [load]);
 
+    // A "Practice this" retry ended too quickly to count as an attempt (see the "NONE" panel below): rather
+    // than strand the candidate on that near-empty page, send them back to the report they were practising
+    // from, unchanged — as if the retry they abandoned had never been started.
+    useEffect(() => {
+        const continuesFromId = data?.status === "NONE" ? data.interview.continuesFromId : null;
+        if (!continuesFromId) return;
+        const timer = setTimeout(() => navigate(`/report/${continuesFromId}`, { replace: true }), 1800);
+        return () => clearTimeout(timer);
+    }, [data, navigate]);
+
     const jumpTo = useCallback((turn: number) => {
         const el = document.getElementById(`t-${turn}`);
         if (!el) return;
@@ -185,6 +197,17 @@ export function Report() {
             toast.error(apiErrorMessage(err, "We couldn't restart the report."));
         } finally {
             setRetrying(false);
+        }
+    }
+
+    async function handlePractice(topics: "all" | string) {
+        setPracticing(topics);
+        try {
+            const { id: newId } = await continueInterview(id, topics === "all" ? "all" : [topics]);
+            navigate(`/lobby/${newId}`);
+        } catch (err) {
+            toast.error(apiErrorMessage(err, "We couldn't start that practice interview."));
+            setPracticing(null);
         }
     }
 
@@ -247,7 +270,7 @@ export function Report() {
                 {/* ------------------------------------------------------------ report states */}
                 {generating && (
                     <div role="status" aria-live="polite" className="mt-12 rounded-xl border bg-card p-8">
-                        <p className="flex items-center gap-3 text-[15px] font-medium">
+                        <p className="flex items-center gap-3 text-[17px] font-medium">
                             <Spinner /> Analysing your interview
                         </p>
                         <p className="mt-3 max-w-xl text-sm leading-relaxed text-muted-foreground">
@@ -261,10 +284,12 @@ export function Report() {
                 )}
 
                 {data.status === "NONE" && (
-                    <div className="mt-12 rounded-xl border bg-card p-8">
-                        <h2 className="text-h3">Not enough to assess.</h2>
+                    <div role="status" aria-live="polite" className="mt-12 rounded-xl border bg-card p-8">
+                        <h2 className="text-h3">{data.interview.continuesFromId ? "That practice run didn't really start." : "Not enough to assess."}</h2>
                         <p className="mt-3 max-w-xl text-sm leading-relaxed text-muted-foreground">
-                            This session was too short for a fair report: it needs a few answers or at least one code submission. Your transcript is below, and you can start again whenever you're ready.
+                            {data.interview.continuesFromId
+                                ? "It ended too quickly to count as an attempt, so nothing changes on the report you were practising from — taking you back to it now."
+                                : "This session was too short for a fair report: it needs a few answers or at least one code submission. Your transcript is below, and you can start again whenever you're ready."}
                         </p>
                     </div>
                 )}
@@ -287,7 +312,7 @@ export function Report() {
                             <div>
                                 <p className="label-mono text-muted-foreground">{BAND_COPY[report.overall.band] ?? report.overall.band}</p>
                                 <p className="mt-3 max-w-2xl font-serif text-3xl leading-tight tracking-tight sm:text-4xl">{report.overall.headline}</p>
-                                <p className="mt-5 max-w-2xl text-[15px] leading-relaxed text-muted-foreground">{report.summary}</p>
+                                <p className="mt-5 max-w-2xl text-[17px] leading-relaxed text-muted-foreground">{report.summary}</p>
                                 <dl className="mt-7 grid grid-cols-2 gap-x-8 gap-y-4 sm:grid-cols-4">
                                     {[
                                         ["Time", `${Math.round(report.metrics.durationMinutes)} min`],
@@ -302,7 +327,7 @@ export function Report() {
                                     ))}
                                 </dl>
                                 {report.metrics.segmentsAnalysed < report.metrics.segmentsTotal && (
-                                    <p className="mt-5 text-[13px] text-muted-foreground">
+                                    <p className="mt-5 text-[15px] text-muted-foreground">
                                         Note: {report.metrics.segmentsTotal - report.metrics.segmentsAnalysed} part of the interview couldn't be analysed, so this score is based on the rest.
                                     </p>
                                 )}
@@ -316,7 +341,7 @@ export function Report() {
                                 {report.dimensions.map((d) => (
                                     <div key={d.key} className="print:break-inside-avoid">
                                         <div className="flex items-baseline justify-between gap-3">
-                                            <h3 className="text-[15px] font-medium">
+                                            <h3 className="text-[17px] font-medium">
                                                 {d.label}
                                                 {d.objective && <span className="label-mono ml-2 text-muted-foreground">from tests</span>}
                                             </h3>
@@ -337,7 +362,7 @@ export function Report() {
                                 {report.rounds.filter((r) => r.type !== "wrapup" && (r.summary || r.score !== null)).map((r) => (
                                     <article key={r.key} className="rounded-xl border bg-card p-6 print:break-inside-avoid">
                                         <div className="flex items-baseline justify-between gap-3">
-                                            <h3 className="text-[15px] font-medium">{r.title}</h3>
+                                            <h3 className="text-[17px] font-medium">{r.title}</h3>
                                             {r.score !== null && <span className="font-mono text-sm tabular-nums">{r.score}/10</span>}
                                         </div>
                                         <p className="mt-3 text-sm leading-relaxed text-muted-foreground">{r.summary}</p>
@@ -370,7 +395,7 @@ export function Report() {
                                 <ul className="grid gap-7">
                                     {report.strengths.map((s) => (
                                         <li key={s.title} className="print:break-inside-avoid">
-                                            <h3 className="text-[15px] font-medium">{s.title}</h3>
+                                            <h3 className="text-[17px] font-medium">{s.title}</h3>
                                             <p className="mt-1.5 text-sm leading-relaxed text-muted-foreground">{s.detail}</p>
                                             <Quotes items={s.evidence} onJump={jumpTo} />
                                         </li>
@@ -382,7 +407,7 @@ export function Report() {
                                 <ul className="grid gap-7">
                                     {report.improvements.map((s) => (
                                         <li key={s.title} className="print:break-inside-avoid">
-                                            <h3 className="flex items-center gap-2 text-[15px] font-medium">
+                                            <h3 className="flex items-center gap-2 text-[17px] font-medium">
                                                 {s.title}
                                                 {s.priority === 1 && <span className="label-mono rounded-full bg-signal px-2 py-0.5 text-signal-foreground">Top priority</span>}
                                             </h3>
@@ -395,8 +420,13 @@ export function Report() {
                         </section>
 
                         {/* -------------------------------------------------------------- study plan */}
-                        <section className="border-t py-16">
-                            <SectionHeading label="Your preparation plan" title="What to practise, in order" />
+                        <section className="border-t py-16 print:hidden">
+                            <SectionHeading label="Your preparation plan" title="What to practise, in order">
+                                <Button variant="outline" size="sm" onClick={() => void handlePractice("all")} disabled={practicing !== null}>
+                                    {practicing === "all" ? <Spinner className="size-4" /> : <Repeat className="size-4" />}
+                                    Practice everything
+                                </Button>
+                            </SectionHeading>
                             <ol className="grid gap-5">
                                 {report.studyPlan.map((s, i) => (
                                     <li key={s.topic} className="grid gap-4 rounded-xl border bg-card p-6 sm:grid-cols-[3rem_1fr] print:break-inside-avoid">
@@ -405,6 +435,10 @@ export function Report() {
                                             <div className="flex flex-wrap items-center gap-3">
                                                 <h3 className="text-lg font-medium">{s.topic}</h3>
                                                 <span className={cn("label-mono rounded-full border px-2 py-0.5", s.priority === "high" && "border-transparent bg-foreground text-background")}>{s.priority} priority</span>
+                                                <Button variant="ghost" size="sm" className="ml-auto h-7 gap-1.5 px-2 text-xs" onClick={() => void handlePractice(s.topic)} disabled={practicing !== null}>
+                                                    {practicing === s.topic ? <Spinner className="size-3.5" /> : <Repeat className="size-3.5" />}
+                                                    Practice this
+                                                </Button>
                                             </div>
                                             <p className="mt-2 text-sm leading-relaxed text-muted-foreground">{s.why}</p>
                                             <Quotes items={s.evidence ?? []} onJump={jumpTo} />
@@ -454,7 +488,7 @@ export function Report() {
                 </section>
 
                 {/* ----------------------------------------------------------------------- footer */}
-                <footer className="border-t pt-8 text-[13px] leading-relaxed text-muted-foreground">
+                <footer className="border-t pt-8 text-[15px] leading-relaxed text-muted-foreground">
                     {report && <p className="max-w-2xl">{report.disclaimer}</p>}
                     <Button variant="ghost" size="sm" className="mt-6 text-muted-foreground print:hidden" onClick={() => setConfirmDelete(true)}>
                         <Trash2 /> Delete this interview

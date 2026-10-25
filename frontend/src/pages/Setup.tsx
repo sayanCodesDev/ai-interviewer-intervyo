@@ -19,19 +19,29 @@ import { cn } from "@/lib/utils";
 
 // Shown until the options load, and used if that request fails, so the form is never empty.
 const FALLBACK: InterviewOptions = {
-    roles: ["Full Stack Developer", "Frontend Engineer", "Backend Engineer", "DevOps / SRE Engineer", "Data Engineer", "Mobile App Developer (React Native/Flutter)", "System Architect / Tech Lead", "Machine Learning Engineer", "Security Engineer", "QA / Test Engineer", "Data Scientist", "Game Developer"],
+    roles: ["Full Stack Developer", "Frontend Engineer", "Backend Engineer", "DevOps / SRE Engineer", "Data Engineer", "Mobile App Developer (React Native/Flutter)", "System Architect / Tech Lead", "Machine Learning Engineer", "Security Engineer", "QA / Test Engineer", "Data Scientist", "Game Developer", "SDE 1", "SDE 2", "Forward Deployed Engineer"],
     levels: ["intern", "junior", "mid", "senior", "staff"],
     formats: [
-        { id: "quick", label: "Quick screen", minutes: 20, description: "A short phone-screen: introductions, your background and one coding problem." },
-        { id: "standard", label: "Standard loop", minutes: 45, description: "Background, two coding problems, technical questions from the job description, and behavioral." },
-        { id: "full", label: "Full loop", minutes: 75, description: "The standard loop plus a third coding problem and a system-design round." },
-        { id: "drill", label: "Coding drill", minutes: 30, description: "Only data structures and algorithms: four problems back to back." },
+        { id: "quick", label: "Quick screen", minutes: 20, description: "The shape of a recruiter or hiring-manager phone screen: introductions, your background, and one coding problem." },
+        { id: "standard", label: "Standard loop", minutes: 45, description: "The shape of a single onsite interviewer's slot: background, two coding problems, technical questions, and behavioral." },
+        { id: "full", label: "Full loop", minutes: 75, description: "The shape of a senior or final-round loop: the standard round plus a third coding problem and a system-design discussion." },
+        { id: "drill", label: "Coding drill", minutes: 30, description: "Not a real interview format: pure practice, four data-structures-and-algorithms problems back to back." },
     ],
     voices: [{ id: "aura-2-thalia-en", name: "Thalia", description: "Clear and confident" }],
     accents: [{ id: "en", label: "English (general)" }],
 };
 
 const LEVEL_LABEL: Record<Level, string> = { intern: "Intern", junior: "Junior", mid: "Mid-level", senior: "Senior", staff: "Staff+" };
+
+/**
+ * The formats aren't equally realistic at every level: "Full loop" describes itself as a senior or
+ * final-round loop, so defaulting to it for a senior or staff candidate — instead of leaving everyone on
+ * the same "Standard loop" default — actually matches the format they're most likely to be practising for.
+ * Intern through mid keep today's "Standard loop" default; nothing changes for them.
+ */
+function defaultFormatForLevel(level: Level): Format {
+    return level === "senior" || level === "staff" ? "full" : "standard";
+}
 
 /** What each format contains, in order. Mirrors the interview engine's presets. */
 const FORMAT_ROUNDS: Record<Format, Array<{ title: string; minutes: number; note?: string }>> = {
@@ -64,7 +74,7 @@ function RadioCard({ name, value, checked, onChange, title, meta, description }:
                 <span className="text-sm font-medium">{title}</span>
                 {meta && <span className="font-mono text-xs text-muted-foreground">{meta}</span>}
             </span>
-            {description && <span className="text-[13px] leading-snug text-muted-foreground">{description}</span>}
+            {description && <span className="text-[15px] leading-snug text-muted-foreground">{description}</span>}
         </label>
     );
 }
@@ -78,6 +88,19 @@ export function Setup() {
     const [role, setRole] = useState(FALLBACK.roles[0]!);
     const [level, setLevel] = useState<Level>("mid");
     const [format, setFormat] = useState<Format>("standard");
+    // Once the candidate has picked a format themselves, the level no longer overrides it — this only
+    // steers the *default*, it never fights a deliberate choice.
+    const formatTouched = useRef(false);
+
+    function handleLevelChange(next: Level) {
+        setLevel(next);
+        if (!formatTouched.current) setFormat(defaultFormatForLevel(next));
+    }
+
+    function handleFormatChange(next: Format) {
+        formatTouched.current = true;
+        setFormat(next);
+    }
     const [jobDescription, setJobDescription] = useState("");
     const [responsibilities, setResponsibilities] = useState("");
     const [githubUrl, setGithubUrl] = useState("");
@@ -137,7 +160,12 @@ export function Setup() {
 
         setLoading(true);
         try {
-            const { id } = await createInterview(form);
+            const { id, githubVerified } = await createInterview(form);
+            // A GitHub account that's confirmed not to exist already blocks setup with a toast (below, via
+            // the server's 400). This is the other case: GitHub couldn't be asked at all (rate-limited, a
+            // network hiccup) — not blocked, since that would lock candidates out over our own inability to
+            // check, but worth saying, or the missing project-specific questions look like a silent bug.
+            if (!githubVerified) toast.warning("We couldn't verify your GitHub account just now, so this interview won't ask about your specific projects. Continuing anyway.");
             navigate(`/lobby/${id}`);
         } catch (error) {
             const fields = apiFieldErrors(error);
@@ -158,13 +186,13 @@ export function Setup() {
                 <section>
                     <p className="label-mono text-muted-foreground">Interview setup</p>
                     <h1 className="text-h2 mt-4">Set up your interview.</h1>
-                    <p className="mt-4 max-w-xl text-[15px] leading-relaxed text-muted-foreground">
+                    <p className="mt-4 max-w-xl text-[17px] leading-relaxed text-muted-foreground">
                         Tell us the role and paste the job description. The interviewer builds its questions from it, like a real loop.
                     </p>
 
                     <form onSubmit={handleSubmit} noValidate className="mt-10 grid max-w-xl gap-8">
-                        <div className="grid gap-6 sm:grid-cols-2">
-                            <Field label="Target role" htmlFor="role" error={errors.role}>
+                        <div className="grid gap-6">
+                            <Field label="Target role" htmlFor="role" error={errors.role} className="sm:max-w-sm">
                                 {(control) => (
                                     <Select value={role} onValueChange={setRole}>
                                         <SelectTrigger {...control}>
@@ -181,18 +209,18 @@ export function Setup() {
                                 )}
                             </Field>
 
-                            <fieldset className="grid gap-2">
-                                <legend className="text-sm font-medium">Your level</legend>
-                                <div role="radiogroup" className="flex flex-wrap gap-1.5">
+                            <fieldset className="grid gap-2.5">
+                                <legend className="mb-2.5 text-sm font-medium">Your level</legend>
+                                <div role="radiogroup" className="flex flex-wrap gap-2">
                                     {options.levels.map((l) => (
                                         <label
                                             key={l}
                                             className={cn(
-                                                "cursor-pointer rounded-full border px-3 py-1.5 text-[13px] transition-colors has-[:focus-visible]:ring-4 has-[:focus-visible]:ring-foreground/10 hover:border-foreground/40",
+                                                "cursor-pointer rounded-full border px-4 py-2 text-[15.5px] transition-colors has-[:focus-visible]:ring-4 has-[:focus-visible]:ring-foreground/10 hover:border-foreground/40",
                                                 level === l ? "border-foreground bg-foreground text-background" : "bg-card text-muted-foreground",
                                             )}
                                         >
-                                            <input type="radio" name="level" value={l} checked={level === l} onChange={() => setLevel(l)} className="sr-only" />
+                                            <input type="radio" name="level" value={l} checked={level === l} onChange={() => handleLevelChange(l)} className="sr-only" />
                                             {LEVEL_LABEL[l]}
                                         </label>
                                     ))}
@@ -204,7 +232,7 @@ export function Setup() {
                             <legend className="text-sm font-medium">Format</legend>
                             <div role="radiogroup" className="grid gap-2.5 sm:grid-cols-2">
                                 {options.formats.map((f) => (
-                                    <RadioCard key={f.id} name="format" value={f.id} checked={format === f.id} onChange={() => setFormat(f.id)} title={f.label} meta={`${f.minutes} min`} description={f.description} />
+                                    <RadioCard key={f.id} name="format" value={f.id} checked={format === f.id} onChange={() => handleFormatChange(f.id)} title={f.label} meta={`${f.minutes} min`} description={f.description} />
                                 ))}
                             </div>
                         </fieldset>
@@ -347,16 +375,16 @@ export function Setup() {
                                     <li key={step.title} className={cn("grid grid-cols-[1.75rem_1fr_auto] items-baseline gap-3", skipped && "opacity-45")}>
                                         <span className="font-mono text-xs text-muted-foreground">{String(index + 1).padStart(2, "0")}</span>
                                         <div>
-                                            <h2 className="text-[15px] font-medium">{skipped ? "Concepts and trade-offs" : step.title}</h2>
-                                            {step.note && !skipped && <p className="mt-0.5 text-[13px] text-muted-foreground">{step.note}</p>}
-                                            {skipped && <p className="mt-0.5 text-[13px] text-muted-foreground">System design starts at mid-level.</p>}
+                                            <h2 className="text-[17px] font-medium">{skipped ? "Concepts and trade-offs" : step.title}</h2>
+                                            {step.note && !skipped && <p className="mt-0.5 text-[15px] text-muted-foreground">{step.note}</p>}
+                                            {skipped && <p className="mt-0.5 text-[15px] text-muted-foreground">System design starts at mid-level.</p>}
                                         </div>
                                         <span className="font-mono text-xs text-muted-foreground">{step.minutes} min</span>
                                     </li>
                                 );
                             })}
                         </ol>
-                        <p className="mt-6 border-t pt-5 text-[13px] leading-relaxed text-muted-foreground">
+                        <p className="mt-6 border-t pt-5 text-[15px] leading-relaxed text-muted-foreground">
                             When it ends you get a scored report with a transcript, feedback on every part, and a plan for what to practise next.
                         </p>
                     </div>

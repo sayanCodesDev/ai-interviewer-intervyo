@@ -7,7 +7,7 @@ import { streamReply } from "./dialogue";
 import type { ServerEvent } from "./events";
 import { fallbackAnalysis } from "./jdAnalysis";
 import { buildPlan } from "./planBuilder";
-import type { Format } from "./plan";
+import type { Format, InterviewPlan, TalkItem } from "./plan";
 import { getProblemDef, type TestRun } from "./problems";
 import { personaPrompt } from "./prompts";
 
@@ -22,14 +22,12 @@ interface Rig {
     speak(turn: Turn | null, reply?: (turn: Turn) => string): Promise<void>;
 }
 
-function makeRig(format: Format = "quick", level: "junior" | "mid" | "senior" = "mid"): Rig {
-    const role = "Backend Engineer";
-    const plan = buildPlan({ role, level, format, analysis: fallbackAnalysis({ role, level }), seed: "rig" });
+function buildRig(plan: InterviewPlan): Rig {
     const clock = { now: 1_000_000 };
     const rounds: string[] = [];
     const conductor = new Conductor({
         plan,
-        systemPrompt: personaPrompt({ interviewerName: "Thalia", role, level, candidateName: "Sam" }),
+        systemPrompt: personaPrompt({ interviewerName: "Thalia", role: plan.role, level: plan.level, candidateName: "Sam" }),
         candidateName: "Sam",
         now: () => clock.now,
         onRoundComplete: (round) => rounds.push(round.key),
@@ -62,7 +60,8 @@ function makeRig(format: Format = "quick", level: "junior" | "mid" | "senior" = 
                 const llm = new FakeLlm(reply(turn));
                 const result = await streamReply(llm, conductor.buildMessages(turn), { maxTokens: turn.maxTokens });
                 let outcome = conductor.finishTurn(turn, result);
-                events.push(...turn.eventsAfter, ...outcome.events);
+                if (!outcome.withholdEventsAfter) events.push(...turn.eventsAfter);
+                events.push(...outcome.events);
                 // The interviewer announced it is moving on; here the candidate says nothing in the pause, so it does.
                 if (outcome.transition) {
                     outcome = conductor.commitTransition();
@@ -72,6 +71,39 @@ function makeRig(format: Format = "quick", level: "junior" | "mid" | "senior" = 
             }
         },
     };
+}
+
+function makeRig(format: Format = "quick", level: "junior" | "mid" | "senior" = "mid"): Rig {
+    const role = "Backend Engineer";
+    const plan = buildPlan({ role, level, format, analysis: fallbackAnalysis({ role, level }), seed: "rig" });
+    return buildRig(plan);
+}
+
+/**
+ * Intro, one background question (about the candidate's own project), then the design round — a hand-picked
+ * three rounds instead of the full loop's whole sequence, so a test can reach either one quickly. The design
+ * round is a real one, pulled from an actual "full" plan, not hand-written.
+ */
+function makeShortRig(): Rig {
+    const role = "Backend Engineer";
+    const level = "mid" as const;
+    const base = buildPlan({ role, level, format: "full", analysis: fallbackAnalysis({ role, level }), seed: "rig-short" });
+    const designRound = base.rounds.find((r) => r.type === "system_design")!;
+    const introItem: TalkItem = { kind: "talk", id: "intro-0", topic: "Introduction", prompt: "Tell me briefly about yourself.", lookFor: [], followUps: [], maxProbes: 0 };
+    const backgroundItem: TalkItem = {
+        kind: "talk", id: "bg-0", topic: "Project architecture",
+        prompt: "Walk me through the architecture of your AI Interviewer project, focusing on how you integrated Deepgram and Groq.",
+        lookFor: ["A clear picture of the main components", "How the pieces talk to each other"], followUps: [], maxProbes: 1,
+    };
+    const plan: InterviewPlan = {
+        ...base,
+        rounds: [
+            { key: "1-intro", type: "intro", title: "Introduction", budgetMinutes: 2, items: [introItem] },
+            { key: "2-background", type: "background", title: "Background and projects", budgetMinutes: 5, items: [backgroundItem] },
+            designRound,
+        ],
+    };
+    return buildRig(plan);
 }
 
 const PASSING: TestRun = { status: "PASSED", passed: 5, total: 5, cases: [], runtimeMs: 3 };
@@ -96,6 +128,23 @@ async function toFirstProblem(rig: Rig) {
 }
 
 const problemKey = (rig: Rig) => (rig.events.filter((e) => e.type === "SHOW_CODE_EDITOR").pop() as any).problem.key as string;
+
+const SUBSTANTIAL = "I built the ledger service in Go with Postgres, and the hardest part was keeping balances consistent under concurrent writes, so we used row locks and idempotency keys to make retries safe.";
+
+/** Answers the introduction (which always gets at least one follow-up) until the interview moves on from it. */
+async function pastIntroduction(rig: Rig) {
+    await rig.speak(rig.conductor.begin());
+    for (let i = 0; i < 5 && rig.conductor.position.round.endsWith("intro"); i++) await rig.speak(rig.conductor.onCandidate(SUBSTANTIAL));
+    assert.doesNotMatch(rig.conductor.position.round, /intro/);
+}
+
+/** Runs the interview to the first background question, with the introduction properly answered. */
+async function atBackground() {
+    const rig = makeRig("quick");
+    await pastIntroduction(rig);
+    assert.match(rig.conductor.position.round, /background/);
+    return rig;
+}
 
 // ----------------------------------------------------------------------------------------- tests
 
@@ -380,6 +429,8 @@ describe("Conductor: time", () => {
     test("running short of time jumps straight to the wrap-up at the next boundary", async () => {
         const rig = makeRig("standard");
         await rig.speak(rig.conductor.begin());
+        // The introduction's follow-up, then its close.
+        await rig.speak(rig.conductor.onCandidate(SUBSTANTIAL));
         rig.clock.now += 41 * 60_000; // 4 of 45 minutes left, wrap-up budget is 3
         await rig.speak(rig.conductor.onCandidate("I'm Sam, a backend engineer with five years of experience in Go and Postgres, mostly building payment services, and lately I have been leading a small team on our platform."), () => "Thanks. [[ADVANCE]]");
         assert.ok(rig.conductor.position.round.endsWith("wrapup") || rig.conductor.position.closing, rig.conductor.position.round);
@@ -389,6 +440,7 @@ describe("Conductor: time", () => {
     test("a part that overruns its budget is cut short", async () => {
         const rig = makeRig("standard");
         await rig.speak(rig.conductor.begin());
+        await rig.speak(rig.conductor.onCandidate(SUBSTANTIAL));
         await rig.speak(rig.conductor.onCandidate("I'm Sam, a backend engineer with five years of experience in Go and Postgres, mostly building payment services, and lately I have been leading a small team on our platform."), () => "Nice. [[ADVANCE]]");
         assert.equal(rig.conductor.position.round, "2-background");
         rig.clock.now += 20 * 60_000; // budget is 6 minutes
@@ -460,7 +512,7 @@ describe("Conductor: context for the model", () => {
 });
 
 describe("Conductor: session facts in the transcript", () => {
-    test("round changes, hints and submissions are recorded as system entries, and never shown to the model as speech", async () => {
+    test("round changes, hints and submissions are recorded as system entries, never attributed as something someone said", async () => {
         const rig = makeRig("quick");
         await toFirstProblem(rig);
         await rig.speak(rig.conductor.onCandidate("I'm stuck, can I have a hint please?"), () => "Sure, think about it this way. [[HINT]]");
@@ -472,26 +524,48 @@ describe("Conductor: session facts in the transcript", () => {
         assert.ok(system.some((t) => /^Hint 1 of 3 given/.test(t)));
         assert.ok(system.some((t) => /submitted python code .* 5 of 5 tests passed/.test(t)));
 
+        // These facts may now legitimately appear in what is sent to the model (see the next test) — the
+        // invariant that matters is that they are never mislabelled as something the candidate or interviewer said.
         const turn = rig.conductor.onCandidate("It runs in linear time because of the single pass through the array.")!;
         for (const message of rig.conductor.buildMessages(turn).slice(1, -1)) {
-            assert.ok(!/^Part \d of/.test(message.content) && !/^Hint \d/.test(message.content), message.content);
+            if (/^Part \d of/.test(message.content) || /^Hint \d/.test(message.content)) {
+                assert.equal(message.role, "system", `a session fact must never be attributed as speech: ${message.content}`);
+            }
         }
+    });
+
+    test("a fact recorded earlier in the round is still visible to the model turns later, not just the one right after it", async () => {
+        const rig = makeRig("quick");
+        await toFirstProblem(rig);
+        await rig.speak(rig.conductor.onSubmission({ problemKey: problemKey(rig), language: "python", code: "x", run: PASSING }));
+        await rig.speak(rig.conductor.onCandidate("It's order n time because of the single pass."), () => "Good, anything else?");
+
+        const turn = rig.conductor.onCandidate("Just checking you saw the code I submitted a minute ago.")!;
+        const messages = rig.conductor.buildMessages(turn);
+        assert.ok(
+            messages.some((m) => m.role === "system" && /submitted python code/.test(m.content)),
+            "the submission should still be in context, not forgotten after the one turn right after it happened",
+        );
+    });
+
+    test("resubmitting after the problem is already solved is still recorded, even though it isn't reviewed again", async () => {
+        const rig = makeRig("quick");
+        await toFirstProblem(rig);
+        const key = problemKey(rig);
+        await rig.speak(rig.conductor.onSubmission({ problemKey: key, language: "python", code: "x = 1", run: PASSING }));
+
+        const result = rig.conductor.onSubmission({ problemKey: key, language: "python", code: "x = 2", run: PASSING });
+        assert.equal(result, null, "a resubmission during follow-up is not reviewed as a new turn");
+
+        const system = rig.conductor.history.filter((u) => u.role === "system").map((u) => u.text);
+        assert.ok(
+            system.some((t) => /updated python solution/.test(t)),
+            "it must still be recorded, or the model has no way to know it happened when the candidate mentions it",
+        );
     });
 });
 
-const SUBSTANTIAL = "I built the ledger service in Go with Postgres, and the hardest part was keeping balances consistent under concurrent writes, so we used row locks and idempotency keys to make retries safe.";
-
 describe("Conductor: moving on only when it is right", () => {
-    /** Runs the interview to the first background question, with the introduction properly answered. */
-    async function atBackground() {
-        const rig = makeRig("quick");
-        await rig.speak(rig.conductor.begin());
-        await rig.speak(rig.conductor.onCandidate(SUBSTANTIAL));
-        await rig.speak(rig.conductor.onCandidate(SUBSTANTIAL));
-        assert.match(rig.conductor.position.round, /background/);
-        return rig;
-    }
-
     test("saying it is moving on does not move: nothing changes until the move is made", async () => {
         const rig = await atBackground();
         const at = rig.conductor.position.item;
@@ -532,23 +606,50 @@ describe("Conductor: moving on only when it is right", () => {
     });
 
     test("a question is not closed on a sentence or two", async () => {
-        const rig = makeRig("quick");
-        await rig.speak(rig.conductor.begin());
-        const turn = rig.conductor.onCandidate("I'm Sam, a backend engineer.")!;
+        const rig = await atBackground();
+        const at = rig.conductor.position.item;
+        const turn = rig.conductor.onCandidate("I built a ledger service.")!;
         assert.match(turn.directive, /do NOT move on/);
         assert.deepEqual([...turn.allowedMarkers], [], "the model cannot end the question yet");
 
-        // Even if it tries, nothing moves.
+        // Even if it tries, nothing moves: a reply that asked nothing is followed by the follow-up it should have asked.
         const outcome = rig.conductor.finishTurn(turn, await streamReply(new FakeLlm("Great. [[ADVANCE]]"), rig.conductor.buildMessages(turn), { maxTokens: 100 }));
-        assert.equal(outcome.transition, undefined);
-        assert.equal(rig.conductor.position.round, "1-intro");
+        assert.equal(outcome.leftHanging, "carry_on");
+        assert.equal(rig.conductor.commitTransition().next?.kind, "carry_on");
+        assert.equal(rig.conductor.position.item, at);
     });
 
     test("after a real answer, or a follow-up, the model may close the question", async () => {
-        const rig = makeRig("quick");
-        await rig.speak(rig.conductor.begin());
+        const rig = await atBackground();
         const turn = rig.conductor.onCandidate(SUBSTANTIAL)!;
         assert.deepEqual([...turn.allowedMarkers], ["ADVANCE"]);
+    });
+
+    test("the introduction is a conversation: even a full answer gets a light follow-up before the interview moves on", async () => {
+        const rig = makeRig("quick");
+        await rig.speak(rig.conductor.begin());
+        const first = rig.conductor.onCandidate(SUBSTANTIAL)!;
+        assert.deepEqual([...first.allowedMarkers], [], "not closed on the first answer, however long");
+        assert.match(first.directive, /This is the introduction, so keep it light/);
+        assert.doesNotMatch(first.directive, /how they did it/, "not the probing wording meant for a technical question");
+
+        // Even a model that tries to move straight on stays in the introduction, and asks its follow-up after all.
+        const outcome = rig.conductor.finishTurn(first, { text: "Great, thanks.", markers: ["ADVANCE"], interrupted: false, firstSentenceMs: 1 });
+        assert.equal(outcome.leftHanging, "carry_on");
+        assert.equal(rig.conductor.commitTransition().next?.kind, "carry_on");
+        assert.equal(rig.conductor.position.round, "1-intro");
+
+        const second = rig.conductor.onCandidate(SUBSTANTIAL)!;
+        assert.deepEqual([...second.allowedMarkers], ["ADVANCE"], "after the follow-up it may close");
+    });
+
+    test("a new part is bridged to: the interviewer closes the part just finished before starting the next", async () => {
+        const rig = makeRig("quick");
+        await toFirstProblem(rig);
+        const ask = rig.turns.find((t) => t.kind === "ask")!;
+        assert.match(ask.directive, /close the introduction part in a few words/);
+        const present = rig.turns.find((t) => t.kind === "present")!;
+        assert.match(present.directive, /Close the background and projects part in a few words, then say you're moving on to a coding problem/);
     });
 
     test("the problem is introduced before the editor opens, and the editor closes as the next thing is said", async () => {
@@ -577,9 +678,18 @@ describe("Conductor: moving on only when it is right", () => {
         const event = rig.conductor.editorEvent() as any;
         assert.equal(event.type, "SHOW_CODE_EDITOR");
         assert.equal(event.problem.key, problemKey(rig));
+    });
+
+    test("a talk question opens no editor on its own, but a sketch pad is there for the topic if the candidate asks for it", async () => {
         const talk = makeRig("quick");
         await talk.speak(talk.conductor.begin());
-        assert.equal(talk.conductor.editorEvent(), null);
+        assert.ok(!talk.turns.some((t) => t.events.some((e) => e.type === "SHOW_CODE_EDITOR") || t.eventsAfter.some((e) => e.type === "SHOW_CODE_EDITOR")), "never opened automatically for a talk question");
+        assert.equal(talk.conductor.editorEvent(), null, "and a reconnect would not pop one open either, since nothing was asked for");
+
+        const event = talk.conductor.requestEditor() as any;
+        assert.equal(event.type, "SHOW_CODE_EDITOR");
+        assert.equal(event.mode, "notes");
+        assert.equal(event.title, "Introduction");
     });
 
     test("a candidate who starts talking before the new question is out does not lose it: the interviewer is told, and carries on or asks it again", async () => {
@@ -645,6 +755,65 @@ describe("Conductor: moving on only when it is right", () => {
         const turn = rig.conductor.onCandidate(SUBSTANTIAL)!;
         rig.conductor.finishTurn(turn, { text: "Got it, thanks for that.", markers: [], interrupted: false, firstSentenceMs: 1 });
         assert.equal(rig.conductor.lastInterviewerAskedQuestion, false);
+    });
+});
+
+describe("Conductor: a sketch pad on any topic, not only system design", () => {
+    test("never opens itself for a talk question, but is there, titled after the question, if asked for", async () => {
+        const rig = makeShortRig();
+        await rig.speak(rig.conductor.begin()); // intro
+        await rig.speak(rig.conductor.onCandidate(SUBSTANTIAL)); // into the background question
+        assert.equal(rig.conductor.position.round, "2-background");
+        assert.ok(!rig.turns.some((t) => t.events.some((e) => e.type === "SHOW_CODE_EDITOR") || t.eventsAfter.some((e) => e.type === "SHOW_CODE_EDITOR")), "never opened on its own");
+        assert.equal(rig.conductor.editorEvent(), null, "nothing to restore on a reconnect either, since nothing was asked for yet");
+
+        const event = rig.conductor.requestEditor() as any;
+        assert.equal(event.type, "SHOW_CODE_EDITOR");
+        assert.equal(event.mode, "notes");
+        assert.equal(event.title, "Project architecture");
+        assert.equal(rig.conductor.editorEvent()?.type, "SHOW_CODE_EDITOR", "now a reconnect would restore it, since it really is open");
+    });
+
+    test("sharing a sketch mid-answer is treated like a substantive answer, and the interviewer can still move on", async () => {
+        const rig = makeShortRig();
+        await rig.speak(rig.conductor.begin());
+        await rig.speak(rig.conductor.onCandidate(SUBSTANTIAL));
+        assert.equal(rig.conductor.position.round, "2-background");
+        const at = rig.conductor.position.item;
+
+        const turn = rig.conductor.onNotes("Boxes: Browser -> API -> Groq (LLM) and API -> Deepgram (STT/TTS), with arrows for the two calls.")!;
+        assert.equal(turn.kind, "respond");
+        assert.match(turn.directive, /shared a drawing/);
+        assert.match(turn.directive, /Groq/);
+        assert.deepEqual([...turn.allowedMarkers], ["ADVANCE"]);
+
+        const outcome = rig.conductor.finishTurn(turn, await streamReply(new FakeLlm("Nice, clear separation of the two APIs. [[ADVANCE]]"), rig.conductor.buildMessages(turn), { maxTokens: 100 }));
+        assert.equal(outcome.transition, true, "the interviewer may still move on from a sketched answer");
+        const moved = rig.conductor.commitTransition();
+        assert.equal(moved.next?.kind, "design_ask", "moved on to the design round next");
+        assert.notEqual(rig.conductor.position.item, at);
+    });
+
+    test("a sketch shared outside a talk or design step (e.g. while coding) is not accepted", async () => {
+        const rig = makeRig("quick");
+        await toFirstProblem(rig);
+        assert.equal(rig.conductor.onNotes("some notes"), null);
+    });
+
+    test("the design round still works exactly as before: notes are read back on every later reply, and the pad opens on its own", async () => {
+        const rig = makeShortRig();
+        await rig.speak(rig.conductor.begin());
+        // Intro, then the background question's initial answer and its one allowed follow-up, to clear it fully.
+        for (let i = 0; i < 3 && rig.conductor.position.step !== "design"; i++) {
+            await rig.speak(rig.conductor.onCandidate(SUBSTANTIAL));
+        }
+        assert.equal(rig.conductor.position.step, "design");
+        assert.ok(rig.turns.some((t) => t.eventsAfter.some((e) => e.type === "SHOW_CODE_EDITOR" && (e as any).mode === "notes")), "opens on its own, unlike a talk question's pad");
+
+        const turn = rig.conductor.onNotes("Load balancer -> app servers -> shared cache -> primary DB with a read replica.")!;
+        assert.equal(turn.kind, "design_respond");
+        assert.match(turn.directive, /Their notes so far/);
+        assert.match(turn.directive, /read replica/);
     });
 });
 
@@ -803,15 +972,6 @@ describe("Conductor: the second follow-up depends on how the problem went", () =
 });
 
 describe("Conductor: when the candidate says they do not know", () => {
-    async function atBackground() {
-        const rig = makeRig("quick");
-        await rig.speak(rig.conductor.begin());
-        await rig.speak(rig.conductor.onCandidate(SUBSTANTIAL));
-        await rig.speak(rig.conductor.onCandidate(SUBSTANTIAL));
-        assert.match(rig.conductor.position.round, /background/);
-        return rig;
-    }
-
     test("the first admission is met with kindness and a simpler question, not pressed and not skipped", async () => {
         const rig = await atBackground();
         const at = rig.conductor.position.item;
@@ -921,15 +1081,6 @@ describe("Conductor: honesty about what the interviewer knows", () => {
 });
 
 describe("Conductor: a reply that asks something does not also move on", () => {
-    async function atBackground() {
-        const rig = makeRig("quick");
-        await rig.speak(rig.conductor.begin());
-        await rig.speak(rig.conductor.onCandidate(SUBSTANTIAL));
-        await rig.speak(rig.conductor.onCandidate(SUBSTANTIAL));
-        assert.match(rig.conductor.position.round, /background/);
-        return rig;
-    }
-
     test("a question with a stray closing marker keeps the topic open", async () => {
         const rig = await atBackground();
         const at = rig.conductor.position.item;
@@ -939,7 +1090,7 @@ describe("Conductor: a reply that asks something does not also move on", () => {
         assert.equal(rig.conductor.position.item, at);
     });
 
-    test("even at the follow-up limit the question asked is answered first, but only once", async () => {
+    test("even at the follow-up limit a question the interviewer asks is answered before moving on, up to a cap", async () => {
         const rig = await atBackground();
         const at = rig.conductor.position.item;
         // Use up the follow-ups (two allowed), with the model asking each time.
@@ -947,14 +1098,57 @@ describe("Conductor: a reply that asks something does not also move on", () => {
             const t = rig.conductor.onCandidate(SUBSTANTIAL)!;
             rig.conductor.finishTurn(t, { text: `And what about the part number ${i}?`, markers: [], interrupted: false, firstSentenceMs: 1 });
         }
-        const last = rig.conductor.onCandidate(SUBSTANTIAL)!;
-        const asked = rig.conductor.finishTurn(last, { text: "Interesting. Why did you choose that?", markers: [], interrupted: false, firstSentenceMs: 1 });
-        assert.equal(asked.transition, undefined, "one more question is allowed to be answered");
-        assert.equal(rig.conductor.position.item, at);
+        // Past the limit the model is told to close the topic, but keeps asking: each question is still theirs to answer.
+        for (const question of ["Interesting. Why did you choose that?", "And how did you test it?", "What would you change now?"]) {
+            const turn = rig.conductor.onCandidate(SUBSTANTIAL)!;
+            assert.match(turn.directive, /may not ask any more follow-ups/);
+            const asked = rig.conductor.finishTurn(turn, { text: question, markers: [], interrupted: false, firstSentenceMs: 1 });
+            assert.equal(asked.transition, undefined, `"${question}" is answered first`);
+            assert.equal(rig.conductor.position.item, at);
+        }
 
         const again = rig.conductor.onCandidate(SUBSTANTIAL)!;
-        const stopped = rig.conductor.finishTurn(again, { text: "And one more thing, how did you test it?", markers: [], interrupted: false, firstSentenceMs: 1 });
+        const stopped = rig.conductor.finishTurn(again, { text: "And one more thing, what did it cost?", markers: [], interrupted: false, firstSentenceMs: 1 });
         assert.equal(stopped.transition, true, "but not for ever");
+    });
+
+    test("a question part-way through a reply counts too, not only one at the very end", async () => {
+        const rig = await atBackground();
+        const turn = rig.conductor.onCandidate(SUBSTANTIAL)!;
+        const outcome = rig.conductor.finishTurn(turn, { text: "Why Postgres over DynamoDB there? Either way, thanks for walking me through it.", markers: ["ADVANCE"], interrupted: false, firstSentenceMs: 1 });
+        assert.equal(outcome.transition, undefined);
+    });
+
+    test("in a design discussion as well: a probing question is answered before the design is closed", async () => {
+        const rig = makeShortRig();
+        await rig.speak(rig.conductor.begin());
+        for (let i = 0; i < 6 && rig.conductor.position.step !== "design"; i++) await rig.speak(rig.conductor.onCandidate(SUBSTANTIAL));
+        assert.equal(rig.conductor.position.step, "design");
+        const turn = rig.conductor.onCandidate(SUBSTANTIAL)!;
+        const outcome = rig.conductor.finishTurn(turn, { text: "Nice. How would you shard the write path?", markers: ["ADVANCE"], interrupted: false, firstSentenceMs: 1 });
+        assert.equal(outcome.transition, undefined);
+        assert.equal(rig.conductor.position.step, "design");
+    });
+
+    test("the follow-up count never closes a question the reply was told to keep open", async () => {
+        // Two questions with no follow-ups allowed at all: the count alone would close the second the moment it is answered.
+        const base = makeRig("quick");
+        const plan = (base.conductor as any).plan as InterviewPlan;
+        const item = (id: string, topic: string): TalkItem => ({ kind: "talk", id, topic, prompt: `Tell me about ${topic}.`, lookFor: [], followUps: [], maxProbes: 0 });
+        const rig = buildRig({ ...plan, rounds: [{ key: "1-background", type: "background", title: "Background and projects", budgetMinutes: 10, items: [item("a", "caching"), item("b", "queues")] }, ...plan.rounds.slice(-1)] });
+        await rig.speak(rig.conductor.begin());
+        const first = rig.conductor.onCandidate(SUBSTANTIAL)!;
+        const moved = rig.conductor.finishTurn(first, { text: "Thanks.", markers: ["ADVANCE"], interrupted: false, firstSentenceMs: 1 });
+        assert.equal(moved.transition, true);
+        const ask = rig.conductor.commitTransition().next!;
+        assert.equal(ask.kind, "ask");
+
+        // The new question is cut off early: the reply must hear them out, so it may not close anything.
+        rig.conductor.finishTurn(ask, { text: "Next, tell me about", markers: [], interrupted: true, delivered: false, firstSentenceMs: 1 });
+        const reply = rig.conductor.onCandidate("Oh, one more thing about caching I forgot to say, the invalidation was event driven.")!;
+        assert.deepEqual([...reply.allowedMarkers], []);
+        const outcome = rig.conductor.finishTurn(reply, { text: "Good to know. Let me ask that again: tell me about queues.", markers: [], interrupted: false, firstSentenceMs: 1 });
+        assert.equal(outcome.transition, undefined, "the question they never heard is still open");
     });
 
     test("a plain acknowledgement with the marker still moves on", async () => {
@@ -962,6 +1156,102 @@ describe("Conductor: a reply that asks something does not also move on", () => {
         const turn = rig.conductor.onCandidate(SUBSTANTIAL)!;
         const outcome = rig.conductor.finishTurn(turn, { text: "Thanks, that covers it.", markers: ["ADVANCE"], interrupted: false, firstSentenceMs: 1 });
         assert.equal(outcome.transition, true);
+    });
+});
+
+describe("Conductor: a coding problem is on screen only once it has been introduced", () => {
+    /** Closes the background questions and stops with the coding problem's introduction written, but not yet said. */
+    async function presenting() {
+        const rig = makeRig("quick");
+        await pastIntroduction(rig);
+        let present: Turn | null = null;
+        for (let i = 0; i < 20 && !present; i++) {
+            const turn = rig.conductor.onCandidate(SUBSTANTIAL)!;
+            const outcome = rig.conductor.finishTurn(turn, { text: "Thanks, that covers it.", markers: ["ADVANCE"], interrupted: false, firstSentenceMs: 1 });
+            if (!outcome.transition) continue;
+            const next = rig.conductor.commitTransition().next;
+            if (next?.kind === "present") present = next;
+            else if (next) rig.conductor.finishTurn(next, { text: "Next question.", markers: [], interrupted: false, firstSentenceMs: 1 });
+        }
+        assert.ok(present, "reached the coding problem");
+        assert.equal(rig.conductor.position.phase, "present");
+        return { rig, present: present! };
+    }
+
+    test("talked over before it was heard, the problem stays off screen and is introduced again after what they said", async () => {
+        const { rig, present } = await presenting();
+        assert.ok(present.eventsAfter.some((e) => e.type === "SHOW_CODE_EDITOR"));
+
+        // The candidate, still finishing their last point, talks over the first few words.
+        const cut = rig.conductor.finishTurn(present, { text: "Alright, let's move on to a", markers: [], interrupted: true, delivered: false, firstSentenceMs: 1 });
+        assert.equal(cut.withholdEventsAfter, true, "the editor does not pop up with a problem nobody explained");
+        assert.equal(rig.conductor.position.phase, "present");
+
+        const again = rig.conductor.onCandidate("Sorry, just to finish, the retries were capped at three.")!;
+        assert.equal(again.kind, "present", "answered, then the problem introduced properly, not treated as talk about code");
+        assert.match(again.directive, /they spoke before you finished/);
+        assert.ok(again.eventsAfter.some((e) => e.type === "SHOW_CODE_EDITOR"), "and it opens once that has been heard");
+        assert.ok(!again.events.some((e) => e.type === "ROUND"), "the part was already announced");
+
+        const heard = rig.conductor.finishTurn(again, { text: "Good point. Now, a coding problem: merge accounts that share an email.", markers: [], interrupted: false, firstSentenceMs: 1 });
+        assert.notEqual(heard.withholdEventsAfter, true);
+        assert.equal(rig.conductor.position.phase, "working");
+        assert.equal(rig.conductor.onCandidate("I'd use union find.")!.kind, "coach");
+    });
+
+    test("cut off only at the very end, it counts as heard", async () => {
+        const { rig, present } = await presenting();
+        const outcome = rig.conductor.finishTurn(present, { text: "Here is the problem. The editor is opening now, talk me through your", markers: [], interrupted: true, delivered: true, firstSentenceMs: 1 });
+        assert.notEqual(outcome.withholdEventsAfter, true);
+        assert.equal(rig.conductor.position.phase, "working");
+    });
+
+    test("an introduction that never got through is tried again after a short pause", async () => {
+        const { rig, present } = await presenting();
+        // The model call failed and an apology was said instead.
+        rig.conductor.finishTurn(present, { text: "Sorry, I had a technical hiccup. Give me a moment.", markers: [], interrupted: true, firstSentenceMs: null });
+        const policy = rig.conductor.silencePolicy()!;
+        assert.ok(policy.nudgeMs[0] <= 10_000, "not two minutes of silence waiting for a problem that never came");
+        const retry = rig.conductor.onSilence(1)!;
+        assert.equal(retry.kind, "present");
+        assert.match(retry.directive, /did not get through/);
+    });
+
+    test("but not endlessly: if it never gets through, the editor opens anyway so the problem can be read", async () => {
+        const { rig, present } = await presenting();
+        const failed = { text: "Sorry, I'm a bit overloaded right now. Give me a moment.", markers: [], interrupted: true, firstSentenceMs: null };
+        assert.equal(rig.conductor.finishTurn(present, failed).withholdEventsAfter, true);
+        assert.equal(rig.conductor.finishTurn(rig.conductor.onSilence(1)!, failed).withholdEventsAfter, true);
+        const third = rig.conductor.onSilence(1)!;
+        assert.notEqual(rig.conductor.finishTurn(third, failed).withholdEventsAfter, true, "the third failure opens it");
+        assert.ok(third.eventsAfter.some((e) => e.type === "SHOW_CODE_EDITOR"));
+        assert.equal(rig.conductor.position.phase, "working");
+        assert.equal(rig.conductor.silencePolicy()!.nudgeMs[0], 120_000, "and the interviewer stops retrying every few seconds");
+    });
+});
+
+describe("Conductor: quiet while drawing is not silence", () => {
+    test("with a sketch pad open on a talk question, the quiet never moves the interview on", async () => {
+        const rig = await atBackground();
+        assert.equal(rig.conductor.silencePolicy()!.autoAdvanceMs, 85_000, "an unanswered question does move on eventually");
+        rig.conductor.requestEditor();
+        const policy = rig.conductor.silencePolicy()!;
+        assert.equal(policy.autoAdvanceMs, null);
+        assert.ok(policy.nudgeMs[0] >= 60_000, "and the first check-in waits for a drawing to take shape");
+        assert.equal(rig.conductor.onSilence(3), null);
+        const nudge = rig.conductor.onSilence(1)!;
+        assert.match(nudge.directive, /drawing on the whiteboard/);
+        assert.doesNotMatch(nudge.directive, /move on/i);
+    });
+
+    test("in the design round too", async () => {
+        const rig = makeShortRig();
+        await rig.speak(rig.conductor.begin());
+        for (let i = 0; i < 6 && rig.conductor.position.step !== "design"; i++) await rig.speak(rig.conductor.onCandidate(SUBSTANTIAL));
+        assert.equal(rig.conductor.position.step, "design");
+        assert.equal(rig.conductor.silencePolicy()!.autoAdvanceMs, null);
+        assert.equal(rig.conductor.onSilence(3), null);
+        assert.match(rig.conductor.onSilence(2)!.directive, /walk you through what they have so far/);
     });
 });
 
@@ -973,5 +1263,226 @@ describe("summariseRun", () => {
         assert.match(text, /empty input \(wrong answer\)/);
         assert.match(text, /large input \(too slow\)/);
         assert.match(summariseRun({ status: "COMPILE_ERROR", passed: 0, total: 5, cases: [], compileOutput: "solution.cpp:4: error: x", runtimeMs: 0 }), /did not compile/);
+    });
+});
+
+const said = (text: string, markers: string[] = []) => ({ text, markers, interrupted: false, firstSentenceMs: 1 });
+
+/** Answers until the candidate's questions at the end, and returns the turn answering their first one. */
+async function atCandidateQuestions(rig: Rig, question: string): Promise<Turn> {
+    await rig.speak(rig.conductor.begin());
+    for (let i = 0; i < 60 && !rig.conductor.isEnded; i++) {
+        const { step, phase, round } = rig.conductor.position;
+        if (/wrapup/.test(round) && step === "talk") return rig.conductor.onCandidate(question)!;
+        if (step === "coding" && phase !== "followup") await rig.speak(rig.conductor.onSubmission({ problemKey: problemKey(rig), language: "python", code: "x", run: PASSING }));
+        else await rig.speak(rig.conductor.onCandidate(SUBSTANTIAL));
+    }
+    throw new Error("never reached the candidate's questions");
+}
+
+// The interviews that went quiet: the interviewer said "Sure, let's move on to the next topic." or "That makes sense." and
+// stopped, without its marker and without a question. The candidate waited for the next question, the interviewer for an
+// answer, until the candidate said "hey, let's start, there's some problem".
+describe("Conductor: a reply that asks nothing never leaves both people waiting", () => {
+    test("saying it is moving on moves on, even without the marker", async () => {
+        const rig = await atBackground();
+        const at = rig.conductor.position.item;
+        const outcome = rig.conductor.finishTurn(rig.conductor.onCandidate(SUBSTANTIAL)!, said("Sure, let's move on to the next topic."));
+        assert.equal(outcome.transition, true, "after the usual pause, in case they want to add something");
+        assert.equal(outcome.leftHanging, "move");
+        assert.ok(rig.conductor.commitTransition().next, "and then the next thing is said, without the candidate having to ask");
+        assert.notEqual(rig.conductor.position.item, at);
+    });
+
+    test("having said so, it moves on even from a question that was not ready to close", async () => {
+        const rig = await atBackground();
+        const at = rig.conductor.position.item;
+        const turn = rig.conductor.onCandidate("I built a ledger service.")!;
+        assert.deepEqual([...turn.allowedMarkers], []);
+        const outcome = rig.conductor.finishTurn(turn, said("Okay, let's move on to the next question."));
+        assert.equal(outcome.leftHanging, "move", "what the candidate heard is what happens");
+        rig.conductor.commitTransition();
+        assert.notEqual(rig.conductor.position.item, at);
+    });
+
+    test("a remark is never taken as closing the topic, even where it could have: a follow-up question follows instead", async () => {
+        const rig = await atBackground();
+        const at = rig.conductor.position.item;
+        const turn = rig.conductor.onCandidate(SUBSTANTIAL)!;
+        assert.deepEqual([...turn.allowedMarkers], ["ADVANCE"]);
+        const outcome = rig.conductor.finishTurn(turn, said("That makes sense. Idempotency keys are a practical way to make retries safe."));
+        assert.equal(outcome.leftHanging, "carry_on");
+        assert.equal(rig.conductor.commitTransition().next?.kind, "carry_on");
+        assert.equal(rig.conductor.position.item, at);
+    });
+
+    test("a question that lost its question mark is still a question: the candidate's turn", async () => {
+        // From a real interview: "That's a solid focus area. What specific projects have you built that show off your web dev and AI skills"
+        const rig = await atBackground();
+        const outcome = rig.conductor.finishTurn(rig.conductor.onCandidate(SUBSTANTIAL)!, said("That's a solid focus area. What specific projects have you built that show off your web dev and AI skills"));
+        assert.equal(outcome.transition, undefined);
+        assert.equal(outcome.leftHanging, undefined);
+    });
+
+    test("a move that is for later is not a move now", async () => {
+        const rig = await atBackground();
+        const outcome = rig.conductor.finishTurn(rig.conductor.onCandidate(SUBSTANTIAL)!, said("Good. Once you've covered the failure cases, we'll move on to the next question."));
+        assert.notEqual(outcome.leftHanging, "move");
+    });
+
+    test("a remark on a question that may not close yet is followed by the follow-up it should have asked", async () => {
+        const rig = await atBackground();
+        const at = rig.conductor.position.item;
+        const outcome = rig.conductor.finishTurn(rig.conductor.onCandidate("I built a ledger service.")!, said("That's a solid project."));
+        assert.equal(outcome.leftHanging, "carry_on");
+        const next = rig.conductor.commitTransition().next!;
+        assert.equal(next.kind, "carry_on");
+        assert.match(next.directive, /Ask ONE follow-up question about one specific thing they just said/);
+        assert.match(next.directive, /ending with a question mark/);
+        assert.equal(rig.conductor.position.item, at, "still the same question");
+    });
+
+    test("telling them to go ahead, or to take their time, leaves the floor to them", async () => {
+        for (const text of ["Take your time.", "Sure, go ahead.", "Got it. Tell me more about the retry logic.", "No problem, keep going."]) {
+            const rig = await atBackground();
+            const outcome = rig.conductor.finishTurn(rig.conductor.onCandidate(SUBSTANTIAL)!, said(text));
+            assert.equal(outcome.transition, undefined, text);
+            assert.equal(outcome.leftHanging, undefined, text);
+        }
+    });
+
+    test("a reply with a question is the candidate's turn, as before", async () => {
+        const rig = await atBackground();
+        const outcome = rig.conductor.finishTurn(rig.conductor.onCandidate(SUBSTANTIAL)!, said("Nice. How did you test the retries?"));
+        assert.equal(outcome.transition, undefined);
+        assert.equal(outcome.leftHanging, undefined);
+    });
+
+    test("after answering something the candidate asked, the interviewer comes back to its question instead of closing it", async () => {
+        const rig = await atBackground();
+        const at = rig.conductor.position.item;
+        const outcome = rig.conductor.finishTurn(rig.conductor.onCandidate("What do you mean by the retry path?")!, said("I meant what happens when a delivery fails and is sent again."));
+        assert.equal(outcome.leftHanging, "carry_on");
+        assert.match(rig.conductor.commitTransition().next!.directive, /You have already answered what they asked, so do not answer it or mention it again/);
+        assert.equal(rig.conductor.position.item, at);
+    });
+
+    test("a carry-on that itself asks nothing gets one plainer second try, and never more", async () => {
+        const rig = await atBackground();
+        rig.conductor.finishTurn(rig.conductor.onCandidate("Is there a glitch? The editor is not showing.")!, said("No glitch on my end."));
+        const carryOn = rig.conductor.commitTransition().next!;
+        assert.equal(carryOn.kind, "carry_on");
+        assert.doesNotMatch(carryOn.directive, /still did not ask/);
+
+        const again = rig.conductor.finishTurn(carryOn, said("No glitch, the editor opens later."));
+        assert.equal(again.leftHanging, "carry_on");
+        const second = rig.conductor.commitTransition().next!;
+        assert.match(second.directive, /still did not ask it/);
+
+        const third = rig.conductor.finishTurn(second, said("Right."));
+        assert.equal(third.transition, undefined, "no third try: the usual check-in covers it from here");
+        assert.equal(rig.conductor.finishTurn(rig.conductor.onCandidate("Okay, sure.")!, said("Good.")).leftHanging, "carry_on", "a new answer starts over");
+    });
+
+    test("in the introduction, coming back to the question never means greeting them all over again", async () => {
+        const rig = makeRig("quick");
+        await rig.speak(rig.conductor.begin());
+        rig.conductor.finishTurn(rig.conductor.onCandidate("Is there a glitch? The editor is not showing.")!, said("No glitch on my end."));
+        const carryOn = rig.conductor.commitTransition().next!;
+        assert.match(carryOn.directive, /Could you tell me a bit about yourself\?/);
+        assert.doesNotMatch(carryOn.directive, /Greet the candidate/);
+        assert.doesNotMatch(rig.conductor.onReconnect()!.directive, /Greet the candidate/, "nor after the call drops and comes back");
+    });
+
+    test("if the candidate speaks in the pause, nothing is added: they are answered where they are", async () => {
+        const rig = await atBackground();
+        rig.conductor.finishTurn(rig.conductor.onCandidate("I built a ledger service.")!, said("That's a solid project."));
+        assert.equal(rig.conductor.hasPendingMove, true);
+        assert.equal(rig.conductor.onCandidate("It handled about two thousand payments a second at peak.")!.kind, "respond");
+        assert.equal(rig.conductor.commitTransition().next, null);
+    });
+
+    test("coding: 'let's move on to the next problem' moves on without the marker; 'let's move on to coding it' does not", async () => {
+        const rig = makeRig("quick");
+        await toFirstProblem(rig);
+        const keepCoding = rig.conductor.finishTurn(rig.conductor.onCandidate("I think a hash map would work here.")!, said("Sounds good, let's move on to coding it."));
+        assert.equal(keepCoding.next, null);
+        assert.equal(keepCoding.leftHanging, undefined);
+        assert.equal(rig.conductor.position.step, "coding");
+
+        const notAsked = rig.conductor.finishTurn(rig.conductor.onCandidate("I'll try a sorted copy first.")!, said("Fine, and when it passes we'll move on to the next problem."));
+        assert.equal(notAsked.leftHanging, undefined, "they did not ask to leave the problem, and it is about later anyway");
+        assert.equal(rig.conductor.position.step, "coding");
+
+        const coach = rig.conductor.onCandidate("I'm stuck. Can we skip this one?")!;
+        assert.equal(coach.kind, "coach");
+        const outcome = rig.conductor.finishTurn(coach, said("Sure, let's move on to the next problem."));
+        assert.equal(outcome.leftHanging, "move");
+        assert.equal(outcome.next?.kind, "explain", "the approach is explained and the interview moves on, as with the marker");
+    });
+
+    test("system design: a remark about the design is followed by a probing question, not the next part", async () => {
+        const rig = makeShortRig();
+        await rig.speak(rig.conductor.begin());
+        for (let i = 0; i < 6 && rig.conductor.position.step !== "design"; i++) await rig.speak(rig.conductor.onCandidate(SUBSTANTIAL));
+        const turn = rig.conductor.onCandidate(SUBSTANTIAL)!;
+        assert.equal(turn.kind, "design_respond");
+        const outcome = rig.conductor.finishTurn(turn, said("I see a queue in front of the workers."));
+        assert.equal(outcome.leftHanging, "carry_on");
+        assert.match(rig.conductor.commitTransition().next!.directive, /probing question about something their design does not cover/);
+        assert.equal(rig.conductor.position.step, "design");
+    });
+
+    test("at the end: after answering their question it asks if they have others, and once they have none it closes", async () => {
+        const rig = makeRig("quick");
+        const turn = await atCandidateQuestions(rig, "What does a typical week look like on the team?");
+        const answered = rig.conductor.finishTurn(turn, said("As an AI interviewer I don't have that information, so that's a good one for the recruiter."));
+        assert.equal(answered.leftHanging, "carry_on");
+        assert.match(rig.conductor.commitTransition().next!.directive, /any other questions for you/);
+
+        const none = rig.conductor.finishTurn(rig.conductor.onCandidate("No, that's all from me, thanks.")!, said("Thanks for your time today."));
+        assert.equal(none.leftHanging, "move");
+    });
+});
+
+describe("Conductor: check-ins escalate instead of repeating", () => {
+    test("after the first check-in the next one is the second, then the move on: not the first one again", async () => {
+        const rig = await atBackground();
+        assert.deepEqual(rig.conductor.silenceChecks(), [{ level: 1, ms: 22_000 }, { level: 2, ms: 50_000 }, { level: 3, ms: 85_000 }]);
+        rig.conductor.onSilence(1);
+        assert.deepEqual(rig.conductor.silenceChecks(), [{ level: 2, ms: 28_000 }, { level: 3, ms: 63_000 }]);
+        rig.conductor.onSilence(2);
+        assert.deepEqual(rig.conductor.silenceChecks(), [{ level: 3, ms: 35_000 }]);
+    });
+
+    test("anything the candidate does starts the quiet over", async () => {
+        const rig = await atBackground();
+        rig.conductor.onSilence(1);
+        rig.conductor.onSilence(2);
+        rig.conductor.onCandidate(SUBSTANTIAL);
+        assert.equal(rig.conductor.silenceChecks()[0]!.level, 1);
+    });
+
+    test("a new question starts the quiet over", async () => {
+        const rig = await atBackground();
+        const at = rig.conductor.position.item;
+        rig.conductor.onSilence(1);
+        rig.conductor.onSilence(2);
+        const forced = rig.conductor.onSilence(3)!;
+        assert.equal(rig.conductor.finishTurn(forced, said("That's fine, let's move on. [[ADVANCE]]", ["ADVANCE"])).transition, true);
+        rig.conductor.commitTransition();
+        assert.notEqual(rig.conductor.position.item, at);
+        assert.equal(rig.conductor.silenceChecks()[0]!.level, 1);
+    });
+
+    test("while drawing: two check-ins, then quiet, never the same one over and over", async () => {
+        const rig = makeShortRig();
+        await rig.speak(rig.conductor.begin());
+        for (let i = 0; i < 6 && rig.conductor.position.step !== "design"; i++) await rig.speak(rig.conductor.onCandidate(SUBSTANTIAL));
+        assert.deepEqual(rig.conductor.silenceChecks().map((c) => c.level), [1, 2]);
+        rig.conductor.onSilence(1);
+        assert.deepEqual(rig.conductor.silenceChecks().map((c) => c.level), [2]);
+        rig.conductor.onSilence(2);
+        assert.deepEqual(rig.conductor.silenceChecks(), []);
     });
 });
